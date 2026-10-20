@@ -1690,7 +1690,7 @@
     <div class="modal master-salt-modal" id="masterSaltModal">
         <h3 class="modal-title">主站盐设置</h3>
         <div class="modal-message">
-            输入主站盐字符串，将用于派生各站点唯一盐值。字符串将被SHA512哈希后作为主站盐。
+            输入主站盐（即主密码）。它只在本机使用，经 PBKDF2-HMAC-SHA-256（310,000 次）派生根密钥后，确定性地生成各平台密码。请牢记该字符串：相同输入才会得到相同密码。
         </div>
 
         <div class="master-salt-input-group">
@@ -1715,10 +1715,13 @@
                     <label class="radio-option"><input type="radio" name="masterSaltTTL" value="forever">永久</label>
                 </div>
             </div>
+            <div class="master-salt-risk" style="margin-top:8px;font-size:12px;line-height:1.6;color:#b45309;">
+                “记住我”只防止他人直接查看浏览器存储，不能阻止能读取本机文件的程序；共用设备请关闭。
+            </div>
         </div>
 
         <div class="master-salt-hash-preview" id="masterSaltHashPreview">
-            <h4>主站盐哈希值（SHA512）</h4>
+            <h4>主密码指纹（SHA-512 前 8 / 后 8 位）</h4>
             <div class="master-salt-hash-value" id="masterSaltHashValue"></div>
         </div>
 
@@ -1811,10 +1814,6 @@
     <!-- 密码选项行 -->
     <div class="account-options-group">
         <div class="account-option-item">
-            <input type="checkbox" id="use-email" checked>
-            <label for="use-email">邮箱</label>
-        </div>
-        <div class="account-option-item">
             <input type="checkbox" id="account-include-special-a" checked>
             <label for="account-include-special-a">字符A</label>
         </div>
@@ -1865,12 +1864,12 @@
             <span class="copy-icon"></span>复制密码
         </button>
         
-        <!-- 迭代次数和加密算法信息 -->
+        <!-- KDF 参数与派生版本 -->
         <div class="iteration-info" id="account-iteration-info">
-            本次迭代次数: <span id="account-iteration-count">0</span>
+            KDF 迭代次数: <span id="account-iteration-count">0</span>
         </div>
         <div class="algorithm-info" id="account-algorithm-info">
-            使用的加密算法: <span id="account-algorithm-name">AES-256-GCM</span>
+            派生版本: <span id="account-algorithm-name">RDCG-v2</span>
         </div>
     </div>
 
@@ -2127,10 +2126,6 @@
     <!-- 核对选项行 -->
     <div class="account-options-group">
         <div class="account-option-item">
-            <input type="checkbox" id="verify-use-email" checked>
-            <label for="verify-use-email">邮箱</label>
-        </div>
-        <div class="account-option-item">
             <input type="checkbox" id="verify-include-special-auto" checked>
             <label for="verify-include-special-auto">自动检测特殊字符</label>
         </div>
@@ -2291,12 +2286,9 @@
         // 出于纯客户端、无网络传输的场景，硬编码 salt 的攻击面有限；
         // 未来如需升级，可在此统一修改并引入版本迁移逻辑。
         static SALTS = {
-            ENHANCED_ACCOUNT_PASSWORD: 'ENHANCED-ACCOUNT-PASSWORD-SALT',
-            ENHANCED_ACCOUNT_IV: 'ENHANCED-ACCOUNT-IV-GEN',
             CODE_GEN: 'RANDOMCODE-GEN-SALT-2024',
             CODE_IV: 'IV-GEN',
-            MASTER_SALT_STORAGE: 'randomcode_salt_2024',
-            CHACHA_BACKUP: 'cha-cha-backup-key'
+            MASTER_SALT_STORAGE: 'randomcode_salt_2024'
         };
 
         constructor() {
@@ -2345,22 +2337,6 @@
             return this.arrayBufferToHex(hash);
         }
 
-        async hmacSha256(key, data) {
-            const keyBuffer = this.strToArrayBuffer(key);
-            const dataBuffer = this.strToArrayBuffer(data);
-
-            const cryptoKey = await crypto.subtle.importKey(
-                'raw',
-                keyBuffer,
-                { name: 'HMAC', hash: 'SHA-256' },
-                false,
-                ['sign']
-            );
-
-            const signature = await crypto.subtle.sign('HMAC', cryptoKey, dataBuffer);
-            return this.arrayBufferToHex(signature);
-        }
-
         async pbkdf2(password, salt, iterations, keyLength = 256, extractable = true) {
             const passwordBuffer = this.strToArrayBuffer(password);
             const saltBuffer = this.strToArrayBuffer(salt);
@@ -2389,35 +2365,6 @@
             return key;
         }
 
-        createSeededRandom(seed) {
-            let state = 0x811C9DC5;
-
-            for (let i = 0; i < seed.length; i++) {
-                state ^= seed.charCodeAt(i);
-                state = (state * 0x01000193) >>> 0;
-            }
-
-            if (state === 0) {
-                state = 0xDEADBEEF;
-            }
-
-            return {
-                next: function() {
-                    state = (state * 1103515245 + 12345) & 0x7FFFFFFF;
-                    return (state / 0x7FFFFFFF);
-                },
-
-                nextInt: function(min, max) {
-                    const result = Math.floor(this.next() * (max - min)) + min;
-                    return Math.max(min, result);
-                },
-
-                nextFloat: function() {
-                    return this.next();
-                }
-            };
-        }
-
         clearCache() {
             this.cache.clear();
             this.pendingCalculations.clear();
@@ -2426,168 +2373,233 @@
 
     const cryptoUtils = new CryptoUtils();
 
-    // ==================== 增强加密算法管理器 ====================
-    class EnhancedCryptoManager {
-        constructor() {
-            this.algorithms = {
-                0: { name: 'AES-256-GCM', implementation: this.encryptWithAES256GCM.bind(this) },
-                1: { name: 'AES-GCM-SIV-LIKE', implementation: this.encryptWithAESGCMSIVLike.bind(this) },
-                2: { name: 'CHACHA20-POLY1305-LIKE', implementation: this.encryptWithChaCha20Poly1305Like.bind(this) }
-            };
+    // ==================== RDCG-v2 确定性派生核心 ====================
+    // 设计约束（修改前必读）：
+    // 1. 密码路径中不得出现 Math.random / crypto.getRandomValues / Date.now；
+    // 2. 同一 VERSION + 规范化上下文 + 生成策略必须恒定输出；
+    // 3. 任何影响输出的常量（字符集、配额、采样、KDF 参数）变更都必须升 VERSION，
+    //    不得原地修改，否则所有既有密码会静默改变。
+    const RDCG = Object.freeze({
+        VERSION: 'RDCG-v2',
+        KDF: Object.freeze({
+            name: 'PBKDF2-HMAC-SHA-256',
+            iterations: 310000,
+            salt: 'RDCG-v2|root-salt',
+            keyBits: 256
+        }),
+        DOMAIN: Object.freeze({
+            site: 'RDCG-v2|site|',
+            stream: 'RDCG-v2|stream|'
+        }),
+        CHARSETS: Object.freeze({
+            numbers: '0123456789',
+            lowercase: 'abcdefghijklmnopqrstuvwxyz',
+            uppercase: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+            specialA: '!@#$%^&*()',
+            specialB: '{}|:"<>?[]\\;\',./_+-='
+        })
+    });
+
+    // 唯一输入规范化入口：生成、核对、缓存、历史都必须经过这里。
+    function normalizeText(value) {
+        return String(value === null || value === undefined ? '' : value).normalize('NFC').trim();
+    }
+
+    // 邮箱语义：框内有内容才参与；空串一律视为 null，避免“关闭邮箱但邮箱仍影响密码”。
+    function buildAccountContext(input) {
+        const email = normalizeText(input.email);
+        return Object.freeze({
+            version: RDCG.VERSION,
+            platform: normalizeText(input.platform),
+            account: normalizeText(input.account),
+            email: email.length > 0 ? email : null,
+            length: Number(input.length),
+            includeSpecialA: !!input.includeSpecialA,
+            includeSpecialB: !!input.includeSpecialB,
+            excludeSimilar: !!input.excludeSimilar
+        });
+    }
+
+    // 固定字段顺序的 JSON 数组：无分隔符歧义，null / false / 空串彼此可区分。
+    function canonicalContext(ctx) {
+        return JSON.stringify([
+            ctx.version,
+            ctx.platform,
+            ctx.account,
+            ctx.email,
+            ctx.length,
+            ctx.includeSpecialA,
+            ctx.includeSpecialB,
+            ctx.excludeSimilar
+        ]);
+    }
+
+    async function deriveRootKey(masterPassword) {
+        const normalized = normalizeText(masterPassword);
+        if (!normalized) {
+            throw new Error('主密码不能为空');
+        }
+        const material = await crypto.subtle.importKey(
+            'raw',
+            cryptoUtils.strToArrayBuffer(normalized),
+            'PBKDF2',
+            false,
+            ['deriveBits']
+        );
+        const bits = await crypto.subtle.deriveBits(
+            {
+                name: 'PBKDF2',
+                salt: cryptoUtils.strToArrayBuffer(RDCG.KDF.salt),
+                iterations: RDCG.KDF.iterations,
+                hash: 'SHA-256'
+            },
+            material,
+            RDCG.KDF.keyBits
+        );
+        return new Uint8Array(bits);
+    }
+
+    async function importRootKey(rootKeyBytes) {
+        return crypto.subtle.importKey(
+            'raw',
+            rootKeyBytes,
+            { name: 'HMAC', hash: 'SHA-256' },
+            false,
+            ['sign']
+        );
+    }
+
+    async function deriveSiteKey(rootKey, ctx) {
+        const signature = await crypto.subtle.sign(
+            'HMAC',
+            rootKey,
+            cryptoUtils.strToArrayBuffer(RDCG.DOMAIN.site + canonicalContext(ctx))
+        );
+        return crypto.subtle.importKey(
+            'raw',
+            signature,
+            { name: 'HMAC', hash: 'SHA-256' },
+            false,
+            ['sign']
+        );
+    }
+
+    // 计数器模式 HMAC 字节流：siteKey + counter 相同则字节流完全一致。
+    class DeterministicByteReader {
+        constructor(siteKey) {
+            this.siteKey = siteKey;
+            this.counter = 0;
+            this.buffer = new Uint8Array(0);
+            this.offset = 0;
         }
 
-        selectAlgorithm(masterSalt, platform, account, email = '') {
-            if (!masterSalt) return 0;
-
-            const seedString = `${masterSalt}::${platform}::${account}::${email}`;
-            const random = cryptoUtils.createSeededRandom(seedString);
-            const algorithmIndex = random.nextInt(0, 3);
-
-            return algorithmIndex;
+        async refill() {
+            const block = await crypto.subtle.sign(
+                'HMAC',
+                this.siteKey,
+                cryptoUtils.strToArrayBuffer(RDCG.DOMAIN.stream + this.counter)
+            );
+            this.counter += 1;
+            this.buffer = new Uint8Array(block);
+            this.offset = 0;
         }
 
-        async encryptWithAES256GCM(data, key, iv) {
-            try {
-                const encrypted = await crypto.subtle.encrypt(
-                    {
-                        name: 'AES-GCM',
-                        iv: iv,
-                        tagLength: 128
-                    },
-                    key,
-                    cryptoUtils.strToArrayBuffer(data)
-                );
-                return cryptoUtils.arrayBufferToHex(encrypted);
-            } catch (error) {
-                console.error('AES-256-GCM加密失败:', error);
-                throw error;
+        async nextByte() {
+            if (this.offset >= this.buffer.length) {
+                await this.refill();
             }
-        }
-
-        async encryptWithAESGCMSIVLike(data, key, iv) {
-            try {
-                const syntheticIV = await cryptoUtils.hmacSha256(
-                    cryptoUtils.arrayBufferToHex(iv.slice(0, 12)),
-                    data
-                );
-
-                const sivIV = new Uint8Array(syntheticIV.match(/.{1,2}/g).map(byte => parseInt(byte, 16))).slice(0, 12);
-
-                const encrypted = await crypto.subtle.encrypt(
-                    {
-                        name: 'AES-GCM',
-                        iv: sivIV,
-                        tagLength: 128
-                    },
-                    key,
-                    cryptoUtils.strToArrayBuffer(data)
-                );
-
-                const encryptedArray = new Uint8Array(encrypted);
-                const resultArray = new Uint8Array(sivIV.length + encryptedArray.length);
-                resultArray.set(sivIV, 0);
-                resultArray.set(encryptedArray, sivIV.length);
-
-                return cryptoUtils.arrayBufferToHex(resultArray);
-            } catch (error) {
-                console.error('AES-GCM-SIV模拟加密失败:', error);
-                throw error;
-            }
-        }
-
-        async encryptWithChaCha20Poly1305Like(data, key, iv) {
-            try {
-                let rawKey;
-                try {
-                    rawKey = await crypto.subtle.exportKey('raw', key);
-                } catch (exportError) {
-                    console.warn('密钥不可提取，将派生新密钥用于AES-CTR:', exportError);
-
-                    const keyMaterial = await crypto.subtle.importKey(
-                        'raw',
-                        cryptoUtils.strToArrayBuffer(CryptoUtils.SALTS.CHACHA_BACKUP),
-                        'PBKDF2',
-                        false,
-                        ['deriveKey']
-                    );
-
-                    const backupKey = await crypto.subtle.deriveKey(
-                        {
-                            name: 'PBKDF2',
-                            salt: new Uint8Array(16),
-                            iterations: 1,
-                            hash: 'SHA-256'
-                        },
-                        keyMaterial,
-                        { name: 'AES-CTR', length: 256 },
-                        true,
-                        ['encrypt']
-                    );
-
-                    rawKey = await crypto.subtle.exportKey('raw', backupKey);
-                }
-
-                const ctrKey = await crypto.subtle.importKey(
-                    'raw',
-                    rawKey,
-                    { name: 'AES-CTR', length: 256 },
-                    false,
-                    ['encrypt']
-                );
-
-                const ctrCounter = new Uint8Array(16);
-                ctrCounter.set(iv.slice(0, 12), 0);
-
-                const encrypted = await crypto.subtle.encrypt(
-                    {
-                        name: 'AES-CTR',
-                        counter: ctrCounter,
-                        length: 64
-                    },
-                    ctrKey,
-                    cryptoUtils.strToArrayBuffer(data)
-                );
-
-                const authKeySeed = cryptoUtils.arrayBufferToHex(rawKey) + cryptoUtils.arrayBufferToHex(iv);
-                const authKey = await cryptoUtils.hmacSha256(
-                    authKeySeed,
-                    'auth-key-context'
-                );
-
-                const authTag = await cryptoUtils.hmacSha256(
-                    authKey,
-                    cryptoUtils.arrayBufferToHex(encrypted)
-                );
-
-                const encryptedArray = new Uint8Array(encrypted);
-                const authTagArray = new Uint8Array(authTag.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
-
-                const resultArray = new Uint8Array(encryptedArray.length + authTagArray.length);
-                resultArray.set(encryptedArray, 0);
-                resultArray.set(authTagArray, encryptedArray.length);
-
-                return cryptoUtils.arrayBufferToHex(resultArray);
-            } catch (error) {
-                console.error('ChaCha20-Poly1305模拟加密失败:', error);
-                return this.encryptWithAES256GCM(data, key, iv);
-            }
-        }
-
-        async encryptWithSelectedAlgorithm(data, key, iv, algorithmIndex) {
-            const algorithm = this.algorithms[algorithmIndex];
-            if (!algorithm) {
-                throw new Error(`未知的算法索引: ${algorithmIndex}`);
-            }
-
-            return await algorithm.implementation(data, key, iv);
-        }
-
-        getAlgorithmName(index) {
-            return this.algorithms[index]?.name || '未知算法';
+            return this.buffer[this.offset++];
         }
     }
 
-    const enhancedCryptoManager = new EnhancedCryptoManager();
+    // 拒绝采样：消除取模偏差，n 必须落在 1..256。
+    async function uniformBelow(reader, n) {
+        if (!Number.isInteger(n) || n <= 0 || n > 256) {
+            throw new Error(`采样范围非法: ${n}`);
+        }
+        const limit = 256 - (256 % n);
+        for (;;) {
+            const byte = await reader.nextByte();
+            if (byte < limit) {
+                return byte % n;
+            }
+        }
+    }
+
+    // 与 v1 相同的配额规则：先均分，余数按类型顺序分配；
+    // 调用方必须保证 length >= 类型数，否则“每类至少一个”无法成立。
+    function allocateCharCounts(length, types) {
+        const counts = {};
+        const base = Math.floor(length / types.length);
+        const remainder = length % types.length;
+        types.forEach((type, index) => {
+            counts[type] = base + (index < remainder ? 1 : 0);
+        });
+        return counts;
+    }
+
+    function buildCharacterSets(includeSpecialA, includeSpecialB, excludeSimilar) {
+        const sets = {
+            numbers: RDCG.CHARSETS.numbers,
+            lowercase: RDCG.CHARSETS.lowercase,
+            uppercase: RDCG.CHARSETS.uppercase,
+            specialA: includeSpecialA ? RDCG.CHARSETS.specialA : '',
+            specialB: includeSpecialB ? RDCG.CHARSETS.specialB : ''
+        };
+        if (excludeSimilar) {
+            sets.numbers = sets.numbers.replace(/[0O]/g, '');
+            sets.lowercase = sets.lowercase.replace(/[il]/g, '');
+            sets.uppercase = sets.uppercase.replace(/[I|]/g, '');
+        }
+        return sets;
+    }
+
+    async function generateDeterministicPassword(ctx, rootKey) {
+        const types = ['numbers', 'lowercase', 'uppercase'];
+        if (ctx.includeSpecialA) types.push('specialA');
+        if (ctx.includeSpecialB) types.push('specialB');
+
+        if (!Number.isInteger(ctx.length) || ctx.length < types.length) {
+            throw new Error(`密码长度至少需要 ${types.length} 位`);
+        }
+
+        const sets = buildCharacterSets(ctx.includeSpecialA, ctx.includeSpecialB, ctx.excludeSimilar);
+        const counts = allocateCharCounts(ctx.length, types);
+        const siteKey = await deriveSiteKey(rootKey, ctx);
+        const reader = new DeterministicByteReader(siteKey);
+
+        const chars = [];
+        for (const type of types) {
+            const charset = sets[type];
+            for (let i = 0; i < counts[type]; i++) {
+                const index = await uniformBelow(reader, charset.length);
+                chars.push({ char: charset[index], type: type });
+            }
+        }
+
+        // Fisher-Yates，无偏
+        for (let i = chars.length - 1; i > 0; i--) {
+            const j = await uniformBelow(reader, i + 1);
+            [chars[i], chars[j]] = [chars[j], chars[i]];
+        }
+
+        // 同类字符不相邻（产品行为，随版本冻结）
+        for (let i = 1; i < chars.length; i++) {
+            if (chars[i].type === chars[i - 1].type) {
+                for (let j = 0; j < chars.length; j++) {
+                    if (j !== i && j !== i - 1 &&
+                        chars[j].type !== chars[i].type &&
+                        (j === 0 || chars[j].type !== chars[j - 1].type) &&
+                        (j === chars.length - 1 || chars[j].type !== chars[j + 1].type)) {
+                        [chars[i], chars[j]] = [chars[j], chars[i]];
+                        break;
+                    }
+                }
+            }
+        }
+
+        return chars.map(item => item.char).join('');
+    }
 
     // ==================== 消息提示管理器 ====================
     class MessageManager {
@@ -2651,10 +2663,13 @@
 
     const messageManager = new MessageManager();
 
-    // ==================== 主站盐管理器 ====================
+    // ==================== 主密码管理器（UI 仍称“主站盐”） ====================
     class MasterSaltManager {
         constructor() {
-            this.masterSalt = null;
+            // v2 不再保存 SHA-512 主站盐，改为保存 PBKDF2 派生出的 rootKey。
+            // rootKeyBytes 仅在“记住我”加密落盘时需要；rootKey 是不可提取的 CryptoKey。
+            this.rootKey = null;
+            this.rootKeyBytes = null;
             this.STORAGE_KEY = 'randomcode_master_salt';
             this.DEFAULT_TTL = 10 * 60 * 1000; // 默认有效期：10 分钟
             this.setTime = null;                // 设置时刻(毫秒)，用于失效判定
@@ -2665,13 +2680,22 @@
             this.loadMasterSalt();
         }
 
-        async generateMasterSalt(inputString, ttlMs = this.DEFAULT_TTL, permanent = false) {
-            if (!inputString || inputString.trim() === '') {
+        async setMasterPassword(inputString, ttlMs = this.DEFAULT_TTL, permanent = false) {
+            const normalized = normalizeText(inputString);
+            if (!normalized) {
                 throw new Error('请输入有效的字符串');
             }
 
-            const masterSalt = await cryptoUtils.sha512(inputString);
-            this.masterSalt = masterSalt;
+            // v2：主密码经 PBKDF2-HMAC-SHA-256（310,000 次）派生 256-bit 根密钥。
+            // 相同主密码 → 相同 rootKey；密码路径中不引入任何随机数。
+            const rootKeyBytes = await deriveRootKey(normalized);
+            const rootKey = await importRootKey(rootKeyBytes);
+
+            // 主密码变更时，旧派生状态必须立即失效。
+            this.clearDerivedState();
+
+            this.rootKeyBytes = rootKeyBytes;
+            this.rootKey = rootKey;
             this.setTime = Date.now();   // 有效期起点 = 设置时刻
             this.isPermanent = permanent === true;
             if (this.isPermanent) {
@@ -2682,7 +2706,19 @@
                 this.ttlMs = ttlMs > 0 ? ttlMs : this.DEFAULT_TTL;
                 this.startExpiryTimer();     // 到期自动失效
             }
-            return masterSalt;
+            return rootKeyBytes;
+        }
+
+        // 清空所有派生状态：rootKey 变更、清除、过期时统一调用，不依赖“重新生成”按钮。
+        clearDerivedState() {
+            cryptoUtils.clearCache();
+            try {
+                if (typeof enhancedAccountPasswordGenerator !== 'undefined' && enhancedAccountPasswordGenerator) {
+                    enhancedAccountPasswordGenerator.clearCache();
+                }
+            } catch (_) {
+                // 页面初始化阶段生成器尚未定义，忽略即可
+            }
         }
 
         stopExpiryTimer() {
@@ -2692,7 +2728,7 @@
             }
         }
 
-        async encryptData(data, fingerPrint) {
+        async encryptData(dataBytes, fingerPrint) {
             try {
                 const key = await cryptoUtils.pbkdf2(
                     fingerPrint,
@@ -2701,7 +2737,8 @@
                     256
                 );
 
-                // 每次加密生成随机 12 字节 IV（AES-GCM 要求 IV 随机且唯一）
+                // 每次加密生成随机 12 字节 IV（AES-GCM 要求 IV 随机且唯一）。
+                // 该随机数只影响存储密文，不进入密码派生路径。
                 const iv = crypto.getRandomValues(new Uint8Array(12));
 
                 const encrypted = await crypto.subtle.encrypt(
@@ -2711,7 +2748,7 @@
                         tagLength: 128
                     },
                     key,
-                    cryptoUtils.strToArrayBuffer(data)
+                    dataBytes
                 );
 
                 // 返回 base64：随机IV + 密文
@@ -2747,7 +2784,7 @@
                     encryptedBytes
                 );
 
-                return cryptoUtils.textDecoder.decode(decrypted);
+                return new Uint8Array(decrypted);
             } catch (error) {
                 console.error('解密失败:', error);
                 return null;
@@ -2755,19 +2792,20 @@
         }
 
         async saveMasterSalt(rememberMe = false, ttlMs = this.ttlMs) {
-            if (!this.masterSalt) {
+            if (!this.rootKeyBytes) {
                 return false;
             }
 
             try {
                 if (rememberMe) {
                     // 每次保存生成随机 fingerprint，与密文一并存储；
-                    // 加载阶段可独立解密，无需预知主站盐，不破坏既有 save/load 流程
+                    // 该随机数只用于存储加密，不影响解密后恢复的 rootKey。
                     const fingerPrint = Array.from(crypto.getRandomValues(new Uint8Array(16)))
                         .map(b => b.toString(16).padStart(2, '0')).join('');
-                    const payload = await this.encryptData(this.masterSalt, fingerPrint);
+                    const payload = await this.encryptData(this.rootKeyBytes, fingerPrint);
 
                     localStorage.setItem(this.STORAGE_KEY, JSON.stringify({
+                        v: RDCG.VERSION,
                         fp: fingerPrint,
                         encrypted: payload,
                         setTime: this.setTime,
@@ -2798,6 +2836,13 @@
                     return false;
                 }
 
+                // 旧版保存的是 SHA-512(masterSalt)，与 v2 的 rootKey 不兼容；
+                // 直接丢弃，要求用户重新输入主密码，避免用错误密钥静默生成密码。
+                if (parsed.v !== RDCG.VERSION) {
+                    localStorage.removeItem(this.STORAGE_KEY);
+                    return false;
+                }
+
                 // 永久记住：无有效期，永不自动失效
                 const permanent = parsed.permanent === true;
 
@@ -2809,9 +2854,10 @@
                     return false;
                 }
 
-                const decryptedMasterSalt = await this.decryptData(parsed.encrypted, parsed.fp);
-                if (decryptedMasterSalt) {
-                    this.masterSalt = decryptedMasterSalt;
+                const decryptedRootKey = await this.decryptData(parsed.encrypted, parsed.fp);
+                if (decryptedRootKey && decryptedRootKey.length === 32) {
+                    this.rootKeyBytes = decryptedRootKey;
+                    this.rootKey = await importRootKey(decryptedRootKey);
                     this.setTime = setTime;
                     this.isPermanent = permanent;
                     if (permanent) {
@@ -2832,11 +2878,13 @@
 
         clearMasterSalt() {
             this.stopExpiryTimer();
-            this.masterSalt = null;
+            this.rootKey = null;
+            this.rootKeyBytes = null;
             this.setTime = null;
             this.ttlMs = this.DEFAULT_TTL;
             this.isPermanent = false;
             localStorage.removeItem(this.STORAGE_KEY);
+            this.clearDerivedState();
         }
 
         // 启动到期定时器：到点清除主站盐并同步界面（永久记住项不启动）
@@ -2861,12 +2909,14 @@
         // 到点失效：清空内存与记住我记录，刷新状态并提示
         _expireNow() {
             this._expiryTimer = null;
-            const had = this.masterSalt !== null;
-            this.masterSalt = null;
+            const had = this.rootKey !== null;
+            this.rootKey = null;
+            this.rootKeyBytes = null;
             this.setTime = null;
             this.ttlMs = this.DEFAULT_TTL;
             this.isPermanent = false;
             localStorage.removeItem(this.STORAGE_KEY);
+            this.clearDerivedState();
 
             if (typeof updateMasterSaltStatus === 'function') {
                 updateMasterSaltStatus();
@@ -2882,41 +2932,13 @@
             if (typeof updateMasterSaltStatus === 'function') {
                 updateMasterSaltStatus();
             }
-            if (!this.masterSalt) {
+            if (!this.rootKey) {
                 masterSaltModalManager.show();
             }
         }
 
-        async generateSiteSalt(platform, account, email = '') {
-            if (!this.masterSalt) {
-                throw new Error('请先设置主站盐');
-            }
-
-            const siteInfo = `${platform}::${account}::${email}`;
-            const siteSalt = await cryptoUtils.hmacSha256(this.masterSalt, siteInfo);
-
-            return siteSalt;
-        }
-
-        generateIterationCount(platform, account, email = '') {
-            if (!this.masterSalt) {
-                return 100000;
-            }
-
-            const seedString = `${this.masterSalt}::${platform}::${account}::${email}`;
-            const random = cryptoUtils.createSeededRandom(seedString);
-
-            const minIterations = 10000;
-            const maxIterations = 100000;
-
-            let iterationCount = random.nextInt(minIterations, maxIterations);
-            iterationCount = Math.max(minIterations, Math.floor(iterationCount));
-
-            return iterationCount;
-        }
-
         isMasterSaltSet() {
-            return this.masterSalt !== null;
+            return this.rootKey !== null;
         }
     }
 
@@ -3067,8 +3089,10 @@
             const input = this.masterSaltInput.value.trim();
             if (input.length > 0) {
                 try {
+                    // 只显示 SHA-512 的前 8 位与后 8 位，用于确认输入一致；
+                    // 完整哈希不再展示，避免把可快速验证的派生材料直接暴露在界面上。
                     const hash = await cryptoUtils.sha512(input);
-                    this.hashValue.textContent = hash;
+                    this.hashValue.textContent = `${hash.slice(0, 8)}…${hash.slice(-8)}`;
                     this.hashPreview.classList.add('visible');
                 } catch (error) {
                     this.hashPreview.classList.remove('visible');
@@ -3091,7 +3115,7 @@
             }
 
             try {
-                const masterSalt = await masterSaltManager.generateMasterSalt(input, ttlMs, permanent);
+                await masterSaltManager.setMasterPassword(input, ttlMs, permanent);
 
                 const saved = await masterSaltManager.saveMasterSalt(rememberMe, ttlMs);
 
@@ -3193,6 +3217,45 @@
             };
 
             this.MAX_HISTORY_ITEMS = 10000;
+
+            // 启动时清理 v1 历史中的敏感字段；只执行一次。
+            this.migrateHistoryV2();
+        }
+
+        // 一次性迁移：删除旧历史中的密码、原文、密钥、结果字段。
+        // 该操作不可逆；用户在方案确认中已接受“历史不存密码”。
+        migrateHistoryV2() {
+            const MIGRATION_KEY = 'randomcode_history_v2_migrated';
+            try {
+                if (localStorage.getItem(MIGRATION_KEY) === '1') {
+                    return;
+                }
+            } catch (error) {
+                return;
+            }
+
+            const stripFields = (storageKey, fields) => {
+                const history = this.getHistory(storageKey);
+                if (!history.length) {
+                    return;
+                }
+                const cleaned = history.map(item => {
+                    const copy = { ...item };
+                    fields.forEach(field => { delete copy[field]; });
+                    return copy;
+                });
+                this.saveHistory(storageKey, cleaned);
+            };
+
+            try {
+                stripFields(this.STORAGE_KEYS.ACCOUNT, ['password', 'useEmail']);
+                stripFields(this.STORAGE_KEYS.PASSWORD, ['password']);
+                stripFields(this.STORAGE_KEYS.CODE, ['ori', 'pwd', 'result']);
+                stripFields(this.STORAGE_KEYS.VERIFY, ['useEmail']);
+                localStorage.setItem(MIGRATION_KEY, '1');
+            } catch (error) {
+                console.warn('历史记录迁移失败:', error);
+            }
         }
 
         safeLocalStorage(method, key, value = null) {
@@ -3351,14 +3414,9 @@
                         (item.email && item.email.toLowerCase().includes(searchLower))
                     );
                 } else if (storageKey === this.STORAGE_KEYS.CODE) {
-                    return (
-                        (item.ori && item.ori.toLowerCase().includes(searchLower)) ||
-                        (item.pwd && item.pwd.toLowerCase().includes(searchLower))
-                    );
+                    return String(item.keyLength || '').includes(searchLower);
                 } else if (storageKey === this.STORAGE_KEYS.PASSWORD) {
-                    return (
-                        (item.password && item.password.toLowerCase().includes(searchLower))
-                    );
+                    return String(item.length || '').includes(searchLower);
                 } else if (storageKey === this.STORAGE_KEYS.VERIFY) {
                     return (
                         (item.platform && item.platform.toLowerCase().includes(searchLower)) ||
@@ -3403,13 +3461,12 @@
                         <div class="history-content">
                             <div><strong>平台:</strong> ${escapeHtml(item.platform) || '未填写'}</div>
                             <div><strong>账户:</strong> ${escapeHtml(item.account) || '未填写'}</div>
-                            <div><strong>邮箱:</strong> ${item.useEmail ? (escapeHtml(item.email) || '未填写') : '不使用邮箱'}</div>
+                            <div><strong>邮箱:</strong> ${escapeHtml(item.email) || '不使用邮箱'}</div>
                             <div><strong>特殊字符A:</strong> ${item.includeSpecialA ? '包含' : '不包含'}</div>
                             <div><strong>特殊字符B:</strong> ${item.includeSpecialB ? '包含' : '不包含'}</div>
                             <div><strong>排除相似:</strong> ${item.excludeSimilar ? '是' : '否'}</div>
                             <div><strong>长度:</strong> ${escapeHtml(item.length) || 16}位</div>
-                            <div><strong>算法:</strong> ${escapeHtml(item.algorithm) || 'AES-256-GCM'}</div>
-                            <div><strong>密码:</strong> ${escapeHtml(item.password) || '无'}</div>
+                            <div><strong>算法:</strong> ${escapeHtml(item.algorithmVersion || (item.algorithm ? 'v1（旧记录）' : 'RDCG-v2'))}</div>
                         </div>
                     `;
                 } else if (storageKey === this.STORAGE_KEYS.PASSWORD) {
@@ -3425,16 +3482,13 @@
                         <div class="history-content">
                             <div><strong>长度:</strong> ${escapeHtml(item.length) || 16}位</div>
                             <div><strong>选项:</strong> ${options.join(', ') || '无'}</div>
-                            <div><strong>密码:</strong> ${escapeHtml(item.password) || '无'}</div>
                         </div>
                     `;
                 } else if (storageKey === this.STORAGE_KEYS.CODE) {
                     content = `
                         <div class="history-content">
-                            <div><strong>原文:</strong> ${escapeHtml(item.ori ? (item.ori.length > 20 ? item.ori.substring(0, 20) + '...' : item.ori) : '') || '未填写'}</div>
-                            <div><strong>密钥:</strong> ${escapeHtml(item.pwd ? (item.pwd.length > 20 ? item.pwd.substring(0, 20) + '...' : item.pwd) : '') || '未填写'}</div>
-                            <div><strong>长度:</strong> ${escapeHtml(item.keyLength) || 0}位</div>
-                            <div><strong>结果:</strong> ${escapeHtml(item.result) || '无'}</div>
+                            <div><strong>输出长度:</strong> ${escapeHtml(item.keyLength) || 0}位</div>
+                            <div><strong>说明:</strong> 仅记录参数，不保存原文、密钥或结果</div>
                         </div>
                     `;
                 } else if (storageKey === this.STORAGE_KEYS.VERIFY) {
@@ -3442,7 +3496,7 @@
                         <div class="history-content">
                             <div><strong>平台:</strong> ${escapeHtml(item.platform) || '未填写'}</div>
                             <div><strong>账户:</strong> ${escapeHtml(item.account) || '未填写'}</div>
-                            <div><strong>邮箱:</strong> ${item.useEmail ? (escapeHtml(item.email) || '未填写') : '不使用邮箱'}</div>
+                            <div><strong>邮箱:</strong> ${escapeHtml(item.email) || '不使用邮箱'}</div>
                             <div><strong>特殊字符A:</strong> ${item.includeSpecialA ? '包含' : '不包含'}</div>
                             <div><strong>特殊字符B:</strong> ${item.includeSpecialB ? '包含' : '不包含'}</div>
                             <div><strong>排除相似:</strong> ${item.excludeSimilar ? '是' : '否'}</div>
@@ -3688,11 +3742,6 @@
             try {
                 this.fullResult = await this.generateFullCode(ori, pwd);
                 this.updateCodeDisplay();
-
-                const result = this.fullResult.substring(0, keyLength);
-                if (result) {
-                    this.saveHistoryDebounced(ori, pwd, keyLength, result);
-                }
             } catch (error) {
                 console.error('计算失败:', error);
                 this.fullResult = '';
@@ -3717,7 +3766,7 @@
             document.getElementById('result-box').classList.toggle('filled', !!finalResult);
         }
 
-        saveHistoryDebounced(ori, pwd, keyLength, result) {
+        saveHistoryDebounced(keyLength) {
             if (this.saveHistoryTimeout) {
                 clearTimeout(this.saveHistoryTimeout);
             }
@@ -3726,13 +3775,11 @@
                 if (!this.isSavingHistory) {
                     this.isSavingHistory = true;
 
+                    // 只记录参数；原文、密钥、结果一律不落盘。
                     historyManager.addHistoryItem(
                         historyManager.STORAGE_KEYS.CODE,
                         {
-                            ori: ori,
-                            pwd: pwd,
-                            keyLength: keyLength,
-                            result: result
+                            keyLength: keyLength
                         }
                     );
 
@@ -3756,7 +3803,7 @@
             const result = document.getElementById('result-box').textContent;
 
             if (ori && pwd && result && result !== '等待输入' && result !== '计算中...' && result !== '计算失败') {
-                this.saveHistoryDebounced(ori, pwd, keyLength, result);
+                this.saveHistoryDebounced(keyLength);
             }
         }
     }
@@ -3766,404 +3813,86 @@
     // ==================== 功能块1：增强的账户密码生成器 ====================
     class EnhancedAccountPasswordGenerator {
         constructor() {
-            this.cache = new Map();
-            this.charSets = {
-                numbers: '0123456789',
-                lowercase: 'abcdefghijklmnopqrstuvwxyz',
-                uppercase: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
-                specialA: '!@#$%^&*()',
-                specialB: '{}|:"<>?[]\\;\',./_+-='
-            };
-            this.isPasswordLengthDragging = false;
             this.currentPassword = '';
-            this.updateTimeout = null;
             this.saveHistoryTimeout = null;
             this.isSavingHistory = false;
-            this.currentAlgorithm = 0;
         }
 
-        async processString(str) {
-            if (!str) return '';
-
-            const cacheKey = `process_${str}`;
-            if (this.cache.has(cacheKey)) {
-                return this.cache.get(cacheKey);
-            }
-
-            try {
-                const normalizedStr = str.trim();
-                if (!normalizedStr) return '';
-
-                const base64 = btoa(encodeURIComponent(normalizedStr).replace(/%([0-9A-F]{2})/g, (match, p1) => {
-                    return String.fromCharCode('0x' + p1);
-                }));
-
-                const reversedBase64 = base64.split('').reverse().join('');
-                const hashHex = await cryptoUtils.sha512(reversedBase64);
-                const result = hashHex.split('').reverse().join('');
-
-                this.cache.set(cacheKey, result);
-                return result;
-            } catch (error) {
-                console.error('字符串处理错误:', error);
-                return '';
-            }
-        }
-
-        async generateAlternativeKey(platform, account) {
-            const cacheKey = `altkey_${platform}_${account}`;
-            if (this.cache.has(cacheKey)) {
-                return this.cache.get(cacheKey);
-            }
-
-            try {
-                const combined = `${platform}:${account}:ALT_KEY`;
-                const result = await this.processString(combined);
-
-                this.cache.set(cacheKey, result);
-                return result;
-            } catch (error) {
-                console.error('生成替代密钥错误:', error);
-                return await cryptoUtils.sha512(`${platform}:${account}:BACKUP_KEY`);
-            }
-        }
-
-        async generateSeedInfo(platform, account, email, useEmail) {
-            if (!platform || !account) return null;
-
-            const cacheKey = `seed_${platform}_${account}_${email}_${useEmail}`;
-            if (this.cache.has(cacheKey)) {
-                return this.cache.get(cacheKey);
-            }
-
-            try {
-                if (!masterSaltManager.isMasterSaltSet()) {
-                    const errorResult = {
-                        error: '请先设置主站盐',
-                        algorithm: 0,
-                        iterationCount: 0
-                    };
-                    this.cache.set(cacheKey, errorResult);
-                    return errorResult;
-                }
-
-                const siteSalt = await masterSaltManager.generateSiteSalt(platform, account, email || '');
-                const iterationCount = masterSaltManager.generateIterationCount(platform, account, email || '');
-                const safeIterationCount = Math.max(1, Math.floor(iterationCount));
-                const algorithmIndex = enhancedCryptoManager.selectAlgorithm(
-                    masterSaltManager.masterSalt,
-                    platform,
-                    account,
-                    email || ''
-                );
-
-                this.currentAlgorithm = algorithmIndex;
-
-                const s1 = await this.processString(platform);
-                const s2 = siteSalt;
-
-                let s3;
-                if (useEmail && email) {
-                    s3 = await this.processString(email);
-                } else {
-                    s3 = await this.generateAlternativeKey(platform, account);
-                }
-
-                if (!s1 || !s2 || !s3) {
-                    throw new Error('种子信息生成失败');
-                }
-
-                const keyMaterial = await crypto.subtle.importKey(
-                    'raw',
-                    cryptoUtils.strToArrayBuffer(s3),
-                    'PBKDF2',
-                    false,
-                    ['deriveKey']
-                );
-
-                const salt = cryptoUtils.strToArrayBuffer(CryptoUtils.SALTS.ENHANCED_ACCOUNT_PASSWORD);
-                const aesKey = await crypto.subtle.deriveKey(
-                    {
-                        name: 'PBKDF2',
-                        salt: salt,
-                        iterations: safeIterationCount,
-                        hash: 'SHA-256'
-                    },
-                    keyMaterial,
-                    { name: 'AES-GCM', length: 256 },
-                    true,
-                    ['encrypt']
-                );
-
-                const combined = s1 + s2 + CryptoUtils.SALTS.ENHANCED_ACCOUNT_IV;
-                const hash = await crypto.subtle.digest('SHA-256', cryptoUtils.strToArrayBuffer(combined));
-                const iv = new Uint8Array(hash.slice(0, 12));
-
-                const result = {
-                    algorithm: algorithmIndex,
-                    iterationCount: safeIterationCount,
-                    iv: iv,
-                    aesKey: aesKey,
-                    s1: s1,
-                    s2: s2,
-                    s3: s3,
-                    error: null
-                };
-
-                this.cache.set(cacheKey, result);
-                return result;
-            } catch (error) {
-                console.error('生成种子信息错误:', error);
-                if (!masterSaltManager.isMasterSaltSet()) {
-                    document.getElementById('account-iteration-info').classList.remove('visible');
-                    document.getElementById('account-algorithm-info').classList.remove('visible');
-                }
-
-                const errorResult = {
-                    error: error.message || '生成种子信息失败',
-                    algorithm: 0,
-                    iterationCount: 0
-                };
-                this.cache.set(cacheKey, errorResult);
-                return errorResult;
-            }
-        }
-
-        /* ========== [修复#6] 补充空种子/边界保护（保持算法不变，避免破坏既有密码派生）========== */
-        createSeededRandom(seed) {
-            let state = 0x811C9DC5;
-
-            if (seed) {
-                for (let i = 0; i < seed.length; i++) {
-                    state ^= seed.charCodeAt(i);
-                    state += (state << 1) + (state << 4) + (state << 7) + (state << 8) + (state << 24);
-                    state &= 0xFFFFFFFF;
-                }
-            }
-
-            if (state === 0) {
-                state = 0xDEADBEEF;
-            }
-
-            return {
-                nextInt: function(min, max) {
-                    state = (state * 1103515245 + 12345) & 0x7FFFFFFF;
-                    const random = state / 0x7FFFFFFF;
-                    return Math.max(min, Math.floor(random * (max - min)) + min);
-                },
-
-                nextFloat: function() {
-                    state = (state * 1103515245 + 12345) & 0x7FFFFFFF;
-                    return state / 0x7FFFFFFF;
-                }
-            };
-        }
-
-        calculateCharCounts(length, includeSpecialA, includeSpecialB) {
-            const charTypes = [
-                { name: 'numbers', order: 0 },
-                { name: 'lowercase', order: 1 },
-                { name: 'uppercase', order: 2 }
-            ];
-
-            if (includeSpecialA) {
-                charTypes.push({ name: 'specialA', order: 3 });
-            }
-            
-            if (includeSpecialB) {
-                charTypes.push({ name: 'specialB', order: 4 });
-            }
-
-            const typeCount = charTypes.length;
-            if (typeCount === 0) return {};
-
-            const baseCount = Math.floor(length / typeCount);
-            const remainder = length % typeCount;
-
-            const counts = {};
-            charTypes.forEach(type => {
-                counts[type.name] = baseCount;
-            });
-
-            for (let i = 0; i < remainder; i++) {
-                const typeIndex = i % typeCount;
-                const typeName = charTypes[typeIndex].name;
-                counts[typeName]++;
-            }
-
-            return counts;
-        }
-
-        getCharacterSet(includeSpecialA, includeSpecialB, excludeSimilar) {
-            let numbers = this.charSets.numbers;
-            let lowercase = this.charSets.lowercase;
-            let uppercase = this.charSets.uppercase;
-            let specialA = includeSpecialA ? this.charSets.specialA : '';
-            let specialB = includeSpecialB ? this.charSets.specialB : '';
-
-            if (excludeSimilar) {
-                numbers = numbers.replace(/[0O]/g, '');
-                lowercase = lowercase.replace(/[il]/g, '');
-                uppercase = uppercase.replace(/[I|]/g, '');
-            }
-
-            return {
-                numbers: numbers,
-                lowercase: lowercase,
-                uppercase: uppercase,
-                specialA: specialA,
-                specialB: specialB
-            };
-        }
-
-        async generatePasswordSimple(platform, account, email, length, includeSpecialA, includeSpecialB, excludeSimilar, useEmail) {
+        // v2 唯一生成入口：输入规范化 → 上下文编码 → HMAC 字节流 → 无偏采样。
+        async generatePassword(platform, account, email, length, includeSpecialA, includeSpecialB, excludeSimilar) {
             if (!masterSaltManager.isMasterSaltSet()) {
                 return '请先设置主站盐';
             }
 
-            if (!platform || platform.trim() === '') {
-                return '请填写平台名称';
+            const normalizedPlatform = normalizeText(platform);
+            const normalizedAccount = normalizeText(account);
+            const normalizedEmail = normalizeText(email);
+
+            if (!normalizedPlatform) return '请填写平台名称';
+            if (!normalizedAccount) return '请填写账户名称';
+            if (normalizedEmail && !InputValidator.validateEmail(normalizedEmail)) return '邮箱格式不正确';
+
+            const numericLength = Number(length);
+            if (!Number.isInteger(numericLength) || numericLength <= 0) return '密码长度不能为0';
+
+            const typeCount = 3 + (includeSpecialA ? 1 : 0) + (includeSpecialB ? 1 : 0);
+            if (numericLength < typeCount) {
+                return `密码长度至少需要 ${typeCount} 位`;
             }
 
-            if (!account || account.trim() === '') {
-                return '请填写账户名称';
-            }
-
-            if (useEmail && email) {
-                if (!InputValidator.validateEmail(email)) {
-                    return '邮箱格式不正确';
-                }
-            }
-
-            if (length === 0) {
-                return '密码长度不能为0';
-            }
-
-            const seedInfo = await this.generateSeedInfo(platform, account, email, useEmail);
-
-            if (seedInfo && seedInfo.error) {
-                return seedInfo.error;
-            }
-
-            if (!seedInfo || !seedInfo.aesKey || !seedInfo.iv) {
-                return '生成种子信息失败';
-            }
+            const ctx = buildAccountContext({
+                platform: normalizedPlatform,
+                account: normalizedAccount,
+                email: normalizedEmail,
+                length: numericLength,
+                includeSpecialA,
+                includeSpecialB,
+                excludeSimilar
+            });
 
             try {
-                const encrypted = await enhancedCryptoManager.encryptWithSelectedAlgorithm(
-                    seedInfo.s1,
-                    seedInfo.aesKey,
-                    seedInfo.iv,
-                    seedInfo.algorithm
-                );
-
-                if (!encrypted) {
-                    throw new Error('加密结果为空');
-                }
-
-                const seed = Array.from(new Uint8Array(new Uint8Array(encrypted.match(/.{1,2}/g).map(byte => parseInt(byte, 16)))))
-                    .map(b => b.toString(16).padStart(2, '0'))
-                    .join('');
-
-                const random = this.createSeededRandom(seed);
-                const charCounts = this.calculateCharCounts(length, includeSpecialA, includeSpecialB);
-                const charTypesOrder = ['numbers', 'lowercase', 'uppercase'];
-                if (includeSpecialA) {
-                    charTypesOrder.push('specialA');
-                }
-                if (includeSpecialB) {
-                    charTypesOrder.push('specialB');
-                }
-
-                const characterSet = this.getCharacterSet(includeSpecialA, includeSpecialB, excludeSimilar);
-                
-                const allChars = [];
-
-                for (const type of charTypesOrder) {
-                    const count = charCounts[type] || 0;
-                    const charset = characterSet[type];
-
-                    if (charset && charset.length > 0) {
-                        for (let i = 0; i < count; i++) {
-                            const charIndex = random.nextInt(0, charset.length);
-                            allChars.push({
-                                char: charset[charIndex],
-                                type: type
-                            });
-                        }
-                    }
-                }
-
-                for (let i = allChars.length - 1; i > 0; i--) {
-                    const j = random.nextInt(0, i + 1);
-                    [allChars[i], allChars[j]] = [allChars[j], allChars[i]];
-                }
-
-                for (let i = 1; i < allChars.length; i++) {
-                    if (allChars[i].type === allChars[i - 1].type) {
-                        for (let j = 0; j < allChars.length; j++) {
-                            if (j !== i && j !== i - 1 &&
-                                allChars[j].type !== allChars[i].type &&
-                                (j === 0 || allChars[j].type !== allChars[j - 1].type) &&
-                                (j === allChars.length - 1 || allChars[j].type !== allChars[j + 1].type)) {
-
-                                [allChars[i], allChars[j]] = [allChars[j], allChars[i]];
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                const password = allChars.map(item => item.char).join('');
+                const password = await generateDeterministicPassword(ctx, masterSaltManager.rootKey);
+                this.currentPassword = password;
+                this.updateDerivationInfo();
                 return password;
             } catch (error) {
-                console.error('加密失败:', error);
-                return '加密失败: ' + error.message;
+                console.error('生成账户密码失败:', error);
+                return '生成失败: ' + error.message;
             }
         }
 
-        async generatePassword(platform, account, email, length, includeSpecialA, includeSpecialB, excludeSimilar, useEmail) {
-            const password = await this.generatePasswordSimple(platform, account, email, length, includeSpecialA, includeSpecialB, excludeSimilar, useEmail);
-            
-            if (password && !password.includes('失败') && password !== '请先设置主站盐' && 
-                password !== '请填写平台名称' && password !== '请填写账户名称' && 
-                password !== '邮箱格式不正确' && password !== '生成种子信息失败' &&
-                password !== '密码长度不能为0') {
-                
-                this.currentPassword = password;
-                
-                const seedInfo = await this.generateSeedInfo(platform, account, email, useEmail);
-                if (seedInfo && !seedInfo.error) {
-                    document.getElementById('account-iteration-count').textContent = seedInfo.iterationCount.toLocaleString();
-                    document.getElementById('account-iteration-info').classList.add('visible');
+        updateDerivationInfo() {
+            const iterationInfo = document.getElementById('account-iteration-info');
+            const iterationCount = document.getElementById('account-iteration-count');
+            const algorithmInfo = document.getElementById('account-algorithm-info');
+            const algorithmName = document.getElementById('account-algorithm-name');
 
-                    document.getElementById('account-algorithm-name').textContent = enhancedCryptoManager.getAlgorithmName(seedInfo.algorithm);
-                    document.getElementById('account-algorithm-info').classList.add('visible');
-                }
+            if (iterationInfo && iterationCount) {
+                iterationCount.textContent = RDCG.KDF.iterations.toLocaleString();
+                iterationInfo.classList.add('visible');
             }
-            
-            return password;
+            if (algorithmInfo && algorithmName) {
+                algorithmName.textContent = `${RDCG.VERSION} / ${RDCG.KDF.name}`;
+                algorithmInfo.classList.add('visible');
+            }
         }
 
         clearCache() {
-            this.cache.clear();
+            // v2 不做派生结果缓存；保留该方法供主密码变更时统一清理。
+            this.currentPassword = '';
         }
 
         saveHistoryDebounced() {
-            const platform = document.getElementById('platform-input').value;
-            const account = document.getElementById('account-input').value;
-            const email = document.getElementById('email-input').value;
+            const platform = normalizeText(document.getElementById('platform-input').value);
+            const account = normalizeText(document.getElementById('account-input').value);
+            const email = normalizeText(document.getElementById('email-input').value);
             const length = parseInt(document.getElementById('account-password-length-input').value) || 16;
             const includeSpecialA = document.getElementById('account-include-special-a').checked;
             const includeSpecialB = document.getElementById('account-include-special-b').checked;
             const excludeSimilar = document.getElementById('account-exclude-similar').checked;
-            const useEmail = document.getElementById('use-email').checked;
 
-            if (!platform || !account || !this.currentPassword ||
-                this.currentPassword === '请先设置主站盐' ||
-                this.currentPassword === '加密失败' ||
-                this.currentPassword.includes('失败') ||
-                this.currentPassword === '密码长度不能为0') {
+            // 只有成功生成的密码才允许记入历史；历史本身不再保存密码明文。
+            if (!platform || !account || !this.currentPassword) {
                 return;
             }
 
@@ -4172,22 +3901,23 @@
             }
 
             this.saveHistoryTimeout = setTimeout(() => {
-                if (!this.isSavingHistory) {
-                    this.isSavingHistory = true;
+                if (this.isSavingHistory) {
+                    return;
+                }
+                this.isSavingHistory = true;
 
+                try {
                     historyManager.addHistoryItem(
                         historyManager.STORAGE_KEYS.ACCOUNT,
                         {
                             platform: platform,
                             account: account,
                             email: email,
-                            useEmail: useEmail,
                             includeSpecialA: includeSpecialA,
                             includeSpecialB: includeSpecialB,
                             excludeSimilar: excludeSimilar,
                             length: length,
-                            algorithm: enhancedCryptoManager.getAlgorithmName(this.currentAlgorithm),
-                            password: this.currentPassword
+                            algorithmVersion: RDCG.VERSION
                         }
                     );
 
@@ -4198,7 +3928,7 @@
                         'account-history-list',
                         searchTerm
                     );
-
+                } finally {
                     this.isSavingHistory = false;
                 }
             }, 500);
@@ -4346,8 +4076,7 @@
                                 includeUppercase: includeUppercase,
                                 includeSpecialA: includeSpecialA,
                                 includeSpecialB: includeSpecialB,
-                                excludeSimilar: excludeSimilar,
-                                password: password
+                                excludeSimilar: excludeSimilar
                             }
                         );
 
@@ -4376,14 +4105,13 @@
     class PasswordVerifier {
         constructor() {
             this.verifyTimeout = null;
-            this.saveHistoryTimeout = null;
-            this.isSavingHistory = false;
             this.isVerifying = false;
+            this.verificationSeq = 0;
+            this.pendingReverify = false;
             this.lastVerification = {
                 platform: '',
                 account: '',
                 email: '',
-                useEmail: false,
                 includeSpecialA: false,
                 includeSpecialB: false,
                 excludeSimilar: false,
@@ -4397,7 +4125,6 @@
             const verifyAccountInput = document.getElementById('verify-account-input');
             const verifyEmailInput = document.getElementById('verify-email-input');
             const verifyPasswordInput = document.getElementById('verify-password-input');
-            const verifyUseEmailCheckbox = document.getElementById('verify-use-email');
             const verifyIncludeSpecialAutoCheckbox = document.getElementById('verify-include-special-auto');
             const verifyIncludeSpecialOverrideCheckbox = document.getElementById('verify-include-special-override');
             const clearVerifyPlatformBtn = document.getElementById('clear-verify-platform');
@@ -4413,11 +4140,6 @@
                     this.updateSpecialCharOverride();
                     this.scheduleVerification();
                 });
-            });
-
-            verifyUseEmailCheckbox.addEventListener('change', () => {
-                this.updateSpecialCharOverride();
-                this.scheduleVerification();
             });
 
             verifyIncludeSpecialAutoCheckbox.addEventListener('change', () => {
@@ -4529,15 +4251,18 @@
         }
 
         async performVerification(isManual = false) {
+            // [修复 M5] 验证期间再次触发不再静默丢弃，标记待重跑，由本轮验证结束后重新基于最新输入验证
             if (this.isVerifying) {
+                this.pendingReverify = true;
                 return;
             }
+            this.verificationSeq++;
+            const mySeq = this.verificationSeq;
 
             const platform = document.getElementById('verify-platform-input').value.trim();
             const account = document.getElementById('verify-account-input').value.trim();
             const email = document.getElementById('verify-email-input').value.trim();
             const password = document.getElementById('verify-password-input').value;
-            const useEmail = document.getElementById('verify-use-email').checked;
             const autoDetectSpecial = document.getElementById('verify-include-special-auto').checked;
             const manualOverrideSpecial = document.getElementById('verify-include-special-override').checked;
             const excludeSimilar = document.getElementById('verify-exclude-similar') ? document.getElementById('verify-exclude-similar').checked : true;
@@ -4587,7 +4312,8 @@
                 return;
             }
 
-            if (useEmail && email) {
+            // 邮箱语义：框内有内容才参与派生，与生成页完全一致。
+            if (email) {
                 if (!InputValidator.validateEmail(email)) {
                     verificationResult.className = 'verification-result neutral';
                     verificationResult.innerHTML = '<span class="verification-text">邮箱格式不正确</span>';
@@ -4621,15 +4347,14 @@
                     includeSpecialB = manualOverrideSpecial;
                 }
 
-                const correctPassword = await enhancedAccountPasswordGenerator.generatePasswordSimple(
-                    platform, 
-                    account, 
-                    useEmail ? email : '', 
+                const correctPassword = await enhancedAccountPasswordGenerator.generatePassword(
+                    platform,
+                    account,
+                    email,
                     password.length,
                     includeSpecialA,
                     includeSpecialB,
-                    excludeSimilar,
-                    useEmail && email ? true : false
+                    excludeSimilar
                 );
 
                 if (correctPassword.includes('失败') || 
@@ -4637,11 +4362,12 @@
                     correctPassword === '请填写平台名称' ||
                     correctPassword === '请填写账户名称' ||
                     correctPassword === '邮箱格式不正确' ||
-                    correctPassword === '生成种子信息失败' ||
-                    correctPassword === '密码长度不能为0') {
+                    correctPassword === '密码长度不能为0' ||
+                    correctPassword.startsWith('密码长度至少需要')) {
                     
                     verificationResult.className = 'verification-result neutral';
-                    verificationResult.innerHTML = `<span class="verification-text">${correctPassword}</span>`;
+                    verificationResult.innerHTML = '<span class="verification-text"></span>';
+                    verificationResult.querySelector('.verification-text').textContent = correctPassword;
                     
                     if (isManual) {
                         verifyButton.innerHTML = '<span class="verify-icon"></span>核对密码';
@@ -4655,36 +4381,24 @@
 
                 if (isCorrect) {
                     verificationResult.className = 'verification-result correct';
-                    verificationResult.innerHTML = `
-                        <span class="verification-icon correct"></span>
-                        <span class="verification-text">密码正确 ✓</span>
-                    `;
+                    verificationResult.innerHTML = '<span class="verification-icon correct"></span><span class="verification-text"></span>';
+                    verificationResult.querySelector('.verification-text').textContent = '密码正确 ✓';
                 } else {
                     verificationResult.className = 'verification-result incorrect';
-                    verificationResult.innerHTML = `
-                        <span class="verification-icon incorrect"></span>
-                        <span class="verification-text">密码不正确 ✗</span>
-                    `;
+                    verificationResult.innerHTML = '<span class="verification-icon incorrect"></span><span class="verification-text"></span>';
+                    verificationResult.querySelector('.verification-text').textContent = '密码不正确 ✗';
                 }
 
                 if (isManual) {
-                    this.saveVerificationHistory(
-                        platform, 
-                        account, 
-                        email, 
-                        useEmail, 
-                        includeSpecialA,
-                        includeSpecialB,
-                        excludeSimilar,
-                        password.length, 
-                        isCorrect ? '正确' : '不正确'
-                    );
+                    verifyButton.innerHTML = '<span class="verify-icon"></span>核对密码';
+                    verifyButton.classList.remove('verifying');
+                    verifyButton.disabled = false;
                 }
-
             } catch (error) {
                 console.error('密码验证失败:', error);
                 verificationResult.className = 'verification-result neutral';
-                verificationResult.innerHTML = `<span class="verification-text">验证失败: ${error.message}</span>`;
+                verificationResult.innerHTML = '<span class="verification-text"></span>';
+                verificationResult.querySelector('.verification-text').textContent = `验证失败: ${error.message}`;
             } finally {
                 if (isManual) {
                     verifyButton.innerHTML = '<span class="verify-icon"></span>核对密码';
@@ -4708,44 +4422,6 @@
             if (this.realTimeIndicator) {
                 this.realTimeIndicator.classList.remove('visible');
             }
-        }
-
-        saveVerificationHistory(platform, account, email, useEmail, includeSpecialA, includeSpecialB, excludeSimilar, inputPasswordLength, result) {
-            if (this.saveHistoryTimeout) {
-                clearTimeout(this.saveHistoryTimeout);
-            }
-
-            this.saveHistoryTimeout = setTimeout(() => {
-                if (!this.isSavingHistory) {
-                    this.isSavingHistory = true;
-
-                    historyManager.addHistoryItem(
-                        historyManager.STORAGE_KEYS.VERIFY,
-                        {
-                            platform: platform,
-                            account: account,
-                            email: email,
-                            useEmail: useEmail,
-                            includeSpecialA: includeSpecialA,
-                            includeSpecialB: includeSpecialB,
-                            excludeSimilar: excludeSimilar,
-                            inputPasswordLength: inputPasswordLength,
-                            result: result,
-                            timestamp: Date.now()
-                        }
-                    );
-
-                    const searchInput = document.getElementById('verify-history-search');
-                    const searchTerm = searchInput ? searchInput.value : '';
-                    historyManager.renderHistory(
-                        historyManager.STORAGE_KEYS.VERIFY,
-                        'verify-history-list',
-                        searchTerm
-                    );
-
-                    this.isSavingHistory = false;
-                }
-            }, 500);
         }
     }
 
@@ -4972,7 +4648,6 @@
                 const includeSpecialA = document.getElementById('account-include-special-a').checked;
                 const includeSpecialB = document.getElementById('account-include-special-b').checked;
                 const excludeSimilar = document.getElementById('account-exclude-similar').checked;
-                const useEmail = document.getElementById('use-email').checked;
 
                 const platformValid = InputValidator.validateInput(document.getElementById('platform-input'), {
                     minLength: 1,
@@ -4996,7 +4671,8 @@
                     return;
                 }
 
-                if (useEmail && email) {
+                // 邮箱框有内容才参与派生；留空不参与，也不再依赖复选框。
+                if (normalizeText(email)) {
                     const emailValid = InputValidator.validateInput(document.getElementById('email-input'), {
                         minLength: 1,
                         maxLength: 256,
@@ -5027,16 +4703,15 @@
 
                 try {
                     const password = await enhancedAccountPasswordGenerator.generatePassword(
-                        platform, account, email, length, includeSpecialA, includeSpecialB, excludeSimilar, useEmail
+                        platform, account, email, length, includeSpecialA, includeSpecialB, excludeSimilar
                     );
 
                     document.getElementById('account-password-box').textContent = password;
                     document.getElementById('account-password-box').classList.toggle('filled',
-                        password !== '请先设置主站盐' && !password.includes('失败') && password !== '密码长度不能为0');
-
-                    if (!enhancedAccountPasswordGenerator.isPasswordLengthDragging) {
-                        enhancedAccountPasswordGenerator.saveCurrentToHistory();
-                    }
+                        password !== '请先设置主站盐' &&
+                        !password.includes('失败') &&
+                        password !== '密码长度不能为0' &&
+                        !password.startsWith('密码长度至少需要'));
                 } catch (error) {
                     console.error('生成账户密码错误:', error);
                     document.getElementById('account-password-box').textContent = '生成失败: ' + error.message;
@@ -5053,10 +4728,6 @@
             if (passwordRAF) cancelAnimationFrame(passwordRAF);
             passwordRAF = requestAnimationFrame(() => {
                 const password = randomPasswordGenerator.generatePassword();
-
-                if (!randomPasswordGenerator.isPasswordLengthDragging) {
-                    randomPasswordGenerator.saveCurrentToHistory();
-                }
             });
         }
 
@@ -5064,10 +4735,6 @@
             if (passwordRAF) cancelAnimationFrame(passwordRAF);
             passwordRAF = requestAnimationFrame(() => {
                 const password = randomPasswordGenerator.generatePassword();
-
-                if (!randomPasswordGenerator.isPasswordLengthDragging) {
-                    randomPasswordGenerator.saveCurrentToHistory();
-                }
             });
         }
 
@@ -5135,16 +4802,10 @@
 
         keyLengthSlider.addEventListener('mouseup', function() {
             codeGenerator.isKeyLengthDragging = false;
-            setTimeout(() => {
-                codeGenerator.saveCurrentToHistory();
-            }, 100);
         });
 
         keyLengthSlider.addEventListener('touchend', function() {
             codeGenerator.isKeyLengthDragging = false;
-            setTimeout(() => {
-                codeGenerator.saveCurrentToHistory();
-            }, 100);
         });
 
         let sliderRAF = null;
@@ -5159,9 +4820,6 @@
 
         keyLengthSlider.addEventListener('change', function() {
             codeGenerator.isKeyLengthDragging = false;
-            setTimeout(() => {
-                codeGenerator.saveCurrentToHistory();
-            }, 100);
         });
 
         keyLengthInput.addEventListener('input', function() {
@@ -5171,10 +4829,6 @@
             this.value = value;
             keyLengthSlider.value = value;
             codeGenerator.updateCodeDisplay();
-
-            setTimeout(() => {
-                codeGenerator.saveCurrentToHistory();
-            }, 300);
         });
 
         clearKeyLengthBtn.addEventListener('click', function() {
@@ -5197,7 +4851,6 @@
         const clearPlatformBtn = document.getElementById('clear-platform');
         const clearAccountBtn = document.getElementById('clear-account');
         const clearEmailBtn = document.getElementById('clear-email');
-        const useEmailCheckbox = document.getElementById('use-email');
         const includeSpecialACheckbox = document.getElementById('account-include-special-a');
         const includeSpecialBCheckbox = document.getElementById('account-include-special-b');
         const excludeSimilarCheckbox = document.getElementById('account-exclude-similar');
@@ -5226,7 +4879,6 @@
             clearTimeout(accountPasswordTimeout);
             accountPasswordTimeout = setTimeout(() => {
                 scheduleAccountPasswordUpdate(true);
-                enhancedAccountPasswordGenerator.saveCurrentToHistory();
             }, 100);
         }
 
@@ -5333,7 +4985,8 @@
         });
 
         emailInput.addEventListener('input', function() {
-            if (useEmailCheckbox.checked) {
+            // 邮箱框有内容才校验并参与派生；清空即视为不参与，仍需重新生成。
+            if (normalizeText(this.value)) {
                 InputValidator.validateInput(this, {
                     minLength: 1,
                     maxLength: 256,
@@ -5341,12 +4994,14 @@
                     pattern: 'email',
                     errorMessage: '请输入有效的邮箱地址'
                 });
-
-                clearTimeout(accountPasswordTimeout);
-                accountPasswordTimeout = setTimeout(() => {
-                    scheduleAccountPasswordUpdate();
-                }, 300);
+            } else {
+                InputValidator.clearError(this);
             }
+
+            clearTimeout(accountPasswordTimeout);
+            accountPasswordTimeout = setTimeout(() => {
+                scheduleAccountPasswordUpdate();
+            }, 300);
         });
 
         clearPlatformBtn.addEventListener('click', function() {
@@ -5364,10 +5019,6 @@
         clearEmailBtn.addEventListener('click', function() {
             emailInput.value = '';
             InputValidator.clearError(emailInput);
-            scheduleAccountPasswordUpdate();
-        });
-
-        useEmailCheckbox.addEventListener('change', function() {
             scheduleAccountPasswordUpdate();
         });
 
@@ -5483,6 +5134,7 @@
             if (result && result !== '等待输入' && result !== '计算中...' && result !== '计算失败') {
                 navigator.clipboard.writeText(result).then(() => {
                     showCopiedFeedback(this, originalHTML);
+                    codeGenerator.saveCurrentToHistory();
                 }).catch(err => {
                     console.error('复制失败:', err);
                     const textArea = document.createElement('textarea');
@@ -5492,6 +5144,7 @@
                     try {
                         document.execCommand('copy');
                         showCopiedFeedback(this, originalHTML);
+                        codeGenerator.saveCurrentToHistory();
                     } catch (copyErr) {
                         console.error('备用复制方法失败:', copyErr);
                         messageManager.show('复制失败，请手动选择复制', 'error', 3000);
@@ -5511,6 +5164,7 @@
                 password !== '生成中...' && password !== '密码长度不能为0') {
                 navigator.clipboard.writeText(password).then(() => {
                     showCopiedFeedback(this, originalHTML);
+                    enhancedAccountPasswordGenerator.saveCurrentToHistory();
                 }).catch(err => {
                     console.error('复制失败:', err);
                     const textArea = document.createElement('textarea');
@@ -5520,6 +5174,7 @@
                     try {
                         document.execCommand('copy');
                         showCopiedFeedback(this, originalHTML);
+                        enhancedAccountPasswordGenerator.saveCurrentToHistory();
                     } catch (copyErr) {
                         console.error('备用复制方法失败:', copyErr);
                         messageManager.show('复制失败，请手动选择复制', 'error', 3000);
@@ -5537,6 +5192,7 @@
                 password !== '请选择至少一种字符类型且长度不能为0' && password !== '生成错误') {
                 navigator.clipboard.writeText(password).then(() => {
                     showCopiedFeedback(this, originalHTML);
+                    randomPasswordGenerator.saveCurrentToHistory();
                 }).catch(err => {
                     console.error('复制失败:', err);
                     const textArea = document.createElement('textarea');
@@ -5546,6 +5202,7 @@
                     try {
                         document.execCommand('copy');
                         showCopiedFeedback(this, originalHTML);
+                        randomPasswordGenerator.saveCurrentToHistory();
                     } catch (copyErr) {
                         console.error('备用复制方法失败:', copyErr);
                         messageManager.show('复制失败，请手动选择复制', 'error', 3000);
