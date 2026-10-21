@@ -5,7 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, viewport-fit=cover">
     <meta name="color-scheme" content="light dark">
-    <title>RANDOMCODE-GEN V4</title>
+    <title>RANDOMCODE-GEN V5</title>
     <style>
         :root {
             --md-sys-color-primary: #6750A4;
@@ -1746,7 +1746,7 @@
 <!-- 主密码状态指示器 -->
 <div class="master-salt-status" id="masterSaltStatus" title="主密码未设置"></div>
 
-<h1>RANDOMCODE-GEN V4</h1>
+<h1>RANDOMCODE-GEN V5</h1>
 
 <!-- 功能块1：平台账户密码生成器 -->
 <div class="card" id="account-card">
@@ -1856,7 +1856,7 @@
             KDF 迭代次数: <span id="account-iteration-count">0</span>
         </div>
         <div class="algorithm-info" id="account-algorithm-info">
-            派生版本: <span id="account-algorithm-name">RDCG-v4</span>
+            派生版本: <span id="account-algorithm-name">RDCG-v5</span>
         </div>
     </div>
 
@@ -2340,23 +2340,23 @@
 
     const cryptoUtils = new CryptoUtils();
 
-    // ==================== RDCG-v4 确定性派生核心 ====================
+    // ==================== RDCG-v5 确定性派生核心 ====================
     // 设计约束（修改前必读）：
     // 1. 密码路径中不得出现 Math.random / crypto.getRandomValues / Date.now；
     // 2. 同一 VERSION + 规范化上下文 + 生成策略必须恒定输出；
     // 3. 任何影响输出的常量（字符集、配额、采样、KDF 参数）变更都必须升 VERSION，
     //    不得原地修改，否则所有既有密码会静默改变。
     const RDCG = Object.freeze({
-        VERSION: 'RDCG-v4',
+        VERSION: 'RDCG-v5',
         KDF: Object.freeze({
             name: 'PBKDF2-HMAC-SHA-256',
             iterations: 310000,
-            salt: 'RDCG-v4|root-salt',
+            salt: 'RDCG-v5|root-salt',
             keyBits: 256
         }),
         DOMAIN: Object.freeze({
-            site: 'RDCG-v4|site|',
-            stream: 'RDCG-v4|stream|'
+            site: 'RDCG-v5|site|',
+            stream: 'RDCG-v5|stream|'
         }),
         CHARSETS: Object.freeze({
             numbers: '0123456789',
@@ -2550,6 +2550,137 @@
         return false;
     }
 
+    // 从字节流取一个小于 n 的 BigInt，用拒绝采样避免取模偏差。
+    async function uniformBigInt(reader, n) {
+        if (n <= 0n) {
+            throw new Error('采样范围非法');
+        }
+        const bits = n.toString(2).length;
+        const bytes = Math.max(1, Math.ceil(bits / 8));
+        const space = 1n << BigInt(bytes * 8);
+        const limit = space - (space % n);
+        for (;;) {
+            let value = 0n;
+            for (let i = 0; i < bytes; i++) {
+                value = (value << 8n) | BigInt(await reader.nextByte());
+            }
+            if (value < limit) {
+                return value % n;
+            }
+        }
+    }
+
+    // 判断剩余配额是否还能排成“同类不相邻”。
+    function isTypeCountFeasible(counts) {
+        const total = counts.reduce((a, b) => a + b, 0);
+        const max = Math.max(...counts);
+        return max <= total - max + 1;
+    }
+
+    // 无偏类型序列采样：按合法完成数加权；超大状态空间降级为可行性加权构造。
+    async function sampleNonAdjacentTypes(pools, reader) {
+        const counts = pools.map(pool => pool.chars.length);
+        const total = counts.reduce((a, b) => a + b, 0);
+        const stateSpace = counts.reduce((acc, c) => acc * (c + 1), 1);
+        const arranged = [];
+        let prev = -1;
+
+        if (stateSpace <= 1000000) {
+            const strides = [];
+            let strideProduct = 1;
+            for (const count of counts) {
+                strides.push(strideProduct);
+                strideProduct *= (count + 1);
+            }
+            const memo = new Map();
+            const countWays = (state, prevType, sum, index) => {
+                if (sum === 0) return 1n;
+                const key = index * 8 + (prevType + 1);
+                const cached = memo.get(key);
+                if (cached !== undefined) return cached;
+                let ways = 0n;
+                for (let i = 0; i < state.length; i++) {
+                    if (state[i] > 0 && i !== prevType) {
+                        state[i]--;
+                        ways += countWays(state, i, sum - 1, index - strides[i]);
+                        state[i]++;
+                    }
+                }
+                memo.set(key, ways);
+                return ways;
+            };
+
+            let stateIndex = 0;
+            let remainingTotal = total;
+            while (arranged.length < total) {
+                const candidates = [];
+                let totalWays = 0n;
+                for (let i = 0; i < counts.length; i++) {
+                    if (counts[i] > 0 && i !== prev) {
+                        counts[i]--;
+                        const ways = countWays(counts, i, remainingTotal - 1, stateIndex - strides[i]);
+                        counts[i]++;
+                        if (ways > 0n) {
+                            candidates.push({ index: i, ways });
+                            totalWays += ways;
+                        }
+                    }
+                }
+                if (candidates.length === 0 || totalWays === 0n) {
+                    throw new Error('无法满足同类字符不相邻约束');
+                }
+                let pick = await uniformBigInt(reader, totalWays);
+                let chosen = candidates[candidates.length - 1];
+                for (const candidate of candidates) {
+                    if (pick < candidate.ways) {
+                        chosen = candidate;
+                        break;
+                    }
+                    pick -= candidate.ways;
+                }
+                arranged.push(pools[chosen.index].chars.pop());
+                counts[chosen.index]--;
+                stateIndex -= strides[chosen.index];
+                remainingTotal--;
+                prev = chosen.index;
+            }
+            return arranged;
+        }
+
+        // 超大状态空间（例如 256 位、5 类）：按剩余配额加权，保证合法且可复现。
+        while (arranged.length < total) {
+            const candidates = [];
+            let weightSum = 0;
+            for (let i = 0; i < counts.length; i++) {
+                if (counts[i] > 0 && i !== prev) {
+                    counts[i]--;
+                    const feasible = isTypeCountFeasible(counts);
+                    counts[i]++;
+                    if (feasible) {
+                        candidates.push(i);
+                        weightSum += counts[i];
+                    }
+                }
+            }
+            if (candidates.length === 0 || weightSum === 0) {
+                throw new Error('无法满足同类字符不相邻约束');
+            }
+            let pick = await uniformBelow(reader, weightSum);
+            let chosen = candidates[candidates.length - 1];
+            for (const index of candidates) {
+                if (pick < counts[index]) {
+                    chosen = index;
+                    break;
+                }
+                pick -= counts[index];
+            }
+            arranged.push(pools[chosen].chars.pop());
+            counts[chosen]--;
+            prev = chosen;
+        }
+        return arranged;
+    }
+
     // 生成结果约定：成功返回密码字符串，失败返回提示字符串。
     function isPasswordError(result) {
         return !result ||
@@ -2560,6 +2691,7 @@
             result === '密码长度不能为0' ||
             result.startsWith('密码长度至少需要') ||
             result.includes('自检未通过') ||
+            result.includes('自检进行中') ||
             result.includes('失败');
     }
 
@@ -2587,49 +2719,13 @@
             }
         }
 
-        // Fisher-Yates + 拒绝采样：只采用满足“同类字符不相邻”的排列。
-        // 字节流由 siteKey 确定，因此重试过程本身也完全可复现。
-        for (let attempt = 0; attempt < 1000; attempt++) {
-            for (let i = chars.length - 1; i > 0; i--) {
-                const j = await uniformBelow(reader, i + 1);
-                [chars[i], chars[j]] = [chars[j], chars[i]];
-            }
-            if (!hasAdjacentSameType(chars)) {
-                return chars.map(item => item.char).join('');
-            }
-        }
-
-        // 随机洗牌 1000 次仍失败时，用确定性构造保证可行排列。
-        // 这不会改变原本能成功生成的密码，只修复 32/64 位等低命中率组合。
+        // 生成类型序列：按“合法完成数”做确定性无偏采样。
+        // 字符本身已由 HMAC 字节流随机抽取，这里只决定类型顺序。
         const pools = types.map(type => ({
             type: type,
             chars: chars.filter(item => item.type === type)
         }));
-        const maxCount = Math.max(...pools.map(pool => pool.chars.length));
-        if (maxCount > chars.length - maxCount + 1) {
-            throw new Error('无法满足同类字符不相邻约束');
-        }
-
-        const arranged = [];
-        let prevType = null;
-        while (arranged.length < chars.length) {
-            const candidates = pools.filter(pool => pool.chars.length > 0 && pool.type !== prevType);
-            if (candidates.length === 0) {
-                break;
-            }
-            const remainingMax = Math.max(...candidates.map(pool => pool.chars.length));
-            const tied = candidates.filter(pool => pool.chars.length === remainingMax);
-            const pick = tied.length === 1
-                ? tied[0]
-                : tied[await uniformBelow(reader, tied.length)];
-            arranged.push(pick.chars.pop());
-            prevType = pick.type;
-        }
-
-        if (arranged.length !== chars.length || hasAdjacentSameType(arranged)) {
-            throw new Error('无法满足同类字符不相邻约束');
-        }
-
+        const arranged = await sampleNonAdjacentTypes(pools, reader);
         return arranged.map(item => item.char).join('');
     }
 
@@ -2698,7 +2794,7 @@
     // ==================== 主密码管理器 ====================
     class MasterSaltManager {
         constructor() {
-            // V4 起主密码只保存在本页内存中，不再写入 localStorage/sessionStorage。
+            // V5 起主密码只保存在本页内存中，不再写入 localStorage/sessionStorage。
             // STORAGE_KEY / SESSION_STORAGE_KEY 仅用于清理旧版本可能留下的记录。
             this.rootKey = null;
             this.rootKeyBytes = null;
@@ -2709,12 +2805,21 @@
             this.ttlMs = this.DEFAULT_TTL;      // 兼容旧字段
             this.isPermanent = false;           // 内存中不自动过期（不再持久化）
             this._expiryTimer = null;            // 兼容旧字段
+            this.keyEpoch = 0;                   // 主密钥代次，用于丢弃旧生成结果
 
             // 页面卸载时清空内存中的根密钥。
             window.addEventListener('pagehide', () => this.handlePageHide());
+            window.addEventListener('pageshow', () => {
+                if (!this.rootKey) {
+                    if (typeof updateMasterSaltStatus === 'function') updateMasterSaltStatus();
+                    if (typeof masterSaltModalManager !== 'undefined' && masterSaltModalManager.show) {
+                        masterSaltModalManager.show();
+                    }
+                }
+            });
 
-            // 启动时只清理旧记录，不再恢复主密码。
-            this.loadMasterSalt();
+            // 启动时只清理旧记录，不再恢复主密码；存储异常也不阻止启动。
+            this.loadMasterSalt().catch(() => {});
         }
 
         // 页面关闭/刷新时清空内存中的根密钥。
@@ -2722,12 +2827,19 @@
             this.rootKey = null;
             this.rootKeyBytes = null;
             this.stopExpiryTimer();
+
+            // 作废旧生成/核对结果，并清空敏感输入。
+            this.clearDerivedState();
+            const verifyPassword = document.getElementById('verify-password-input');
+            if (verifyPassword) {
+                verifyPassword.value = '';
+            }
         }
 
         // 删除两种存储里的主密码记录。
         removeStoredMasterSalt() {
-            localStorage.removeItem(this.STORAGE_KEY);
-            sessionStorage.removeItem(this.SESSION_STORAGE_KEY);
+            try { localStorage.removeItem(this.STORAGE_KEY); } catch (_) {}
+            try { sessionStorage.removeItem(this.SESSION_STORAGE_KEY); } catch (_) {}
         }
 
         // 设置主密码：派生根密钥，并启动有效期计时。
@@ -2737,7 +2849,7 @@
                 throw new Error('请输入有效的字符串');
             }
 
-            // V4：主密码经 PBKDF2-HMAC-SHA-256（310,000 次）派生 256-bit 根密钥。
+            // V5：主密码经 PBKDF2-HMAC-SHA-256（310,000 次）派生 256-bit 根密钥。
             // 相同主密码 → 相同 rootKey；密码路径中不引入任何随机数。
             const rootKeyBytes = await deriveRootKey(normalized);
             const rootKey = await importRootKey(rootKeyBytes);
@@ -2762,6 +2874,8 @@
 
         // 清空所有派生状态：rootKey 变更、清除、过期时统一调用，不依赖“重新生成”按钮。
         clearDerivedState() {
+            // 主密钥代次递增：旧生成任务写回时会被丢弃。
+            this.keyEpoch++;
             cryptoUtils.clearCache();
             try {
                 if (typeof enhancedAccountPasswordGenerator !== 'undefined' && enhancedAccountPasswordGenerator) {
@@ -2798,7 +2912,7 @@
             }
         }
 
-        // V4 起主密码只保存在内存中；启动时只清理旧版本可能留下的记录。
+        // V5 起主密码只保存在内存中；启动时只清理旧版本可能留下的记录。
         async loadMasterSalt() {
             this.removeStoredMasterSalt();
             return false;
@@ -2945,6 +3059,8 @@
             this.hashValue = document.getElementById('masterSaltHashValue');
             this.checkTimer = null;   // 校验值防抖定时器
             this.checkSeq = 0;        // 校验值计算序号，用于丢弃过期结果
+            this.confirmSeq = 0;      // 设置主密码的提交序号
+            this.isSubmitting = false;
             this.cancelButton = document.getElementById('masterSaltCancel');
             this.confirmButton = document.getElementById('masterSaltConfirm');
             this.clearButton = document.getElementById('masterSaltClear');
@@ -2974,6 +3090,8 @@
             });
 
             this.masterSaltInput.addEventListener('input', () => {
+                // 输入一变，正在进行的提交立即失效。
+                this.confirmSeq++;
                 this.validateInput();
                 this.scheduleCheckValue();
             });
@@ -3033,7 +3151,7 @@
                 const signature = await crypto.subtle.sign(
                     'HMAC',
                     rootKey,
-                    cryptoUtils.strToArrayBuffer('RDCG-v4|master-check')
+                    cryptoUtils.strToArrayBuffer('RDCG-v5|master-check')
                 );
                 if (seq !== this.checkSeq) return;
 
@@ -3048,15 +3166,30 @@
 
         // 点击“设置主密码”后的完整流程。
         async handleConfirm() {
+            if (this.isSubmitting) {
+                return;
+            }
+
             const input = this.masterSaltInput.value.trim();
 
             if (!this.validateInput()) {
                 return;
             }
 
+            this.isSubmitting = true;
+            const seq = ++this.confirmSeq;
+            this.masterSaltInput.disabled = true;
+            this.confirmButton.disabled = true;
+
             try {
-                // V4 起主密码只保存在内存中；不写入 localStorage/sessionStorage。
+                // V5 起主密码只保存在内存中；不写入 localStorage/sessionStorage。
                 await masterSaltManager.setMasterPassword(input, 0, true);
+
+                // 派生期间输入变化、取消或关闭都会使序号失效。
+                if (seq !== this.confirmSeq) {
+                    masterSaltManager.clearMasterSalt();
+                    return;
+                }
 
                 updateMasterSaltStatus();
 
@@ -3078,6 +3211,10 @@
             } catch (error) {
                 console.error('设置主密码失败:', error);
                 messageManager.show(`设置主密码失败: ${error.message}`, 'error', 3000);
+            } finally {
+                this.isSubmitting = false;
+                this.masterSaltInput.disabled = false;
+                this.confirmButton.disabled = false;
             }
         }
 
@@ -3131,6 +3268,7 @@
             // 关闭时清空输入框、校验值，并取消尚未完成的计算
             clearTimeout(this.checkTimer);
             this.checkSeq++;
+            this.confirmSeq++;
             this.masterSaltInput.value = '';
             this.hashValue.textContent = '';
             this.hashPreview.classList.remove('visible');
@@ -3422,7 +3560,7 @@
                             <div><strong>特殊字符B:</strong> ${item.includeSpecialB ? '包含' : '不包含'}</div>
                             <div><strong>排除相似:</strong> ${item.excludeSimilar ? '是' : '否'}</div>
                             <div><strong>长度:</strong> ${escapeHtml(item.length) || 16}位</div>
-                            <div><strong>算法:</strong> ${escapeHtml(item.algorithmVersion || (item.algorithm ? 'v1（旧记录）' : 'RDCG-v4'))}</div>
+                            <div><strong>算法:</strong> ${escapeHtml(item.algorithmVersion || (item.algorithm ? 'v1（旧记录）' : 'RDCG-v5'))}</div>
                         </div>
                     `;
                 } else if (storageKey === this.STORAGE_KEYS.PASSWORD) {
@@ -3782,16 +3920,19 @@
         constructor() {
             this.currentPassword = '';
             this.currentContext = null;
+            this.currentKeyEpoch = -1;
             this.saveHistoryTimeout = null;
             this.isSavingHistory = false;
         }
 
-        // V4 唯一生成入口：输入规范化 → 上下文编码 → HMAC 字节流 → 无偏采样。
+        // V5 唯一生成入口：输入规范化 → 上下文编码 → HMAC 字节流 → 无偏采样。
         // 校验输入并生成账户密码。
         async generatePassword(platform, account, email, length, includeSpecialA, includeSpecialB, excludeSimilar) {
-            // 自检失败时禁止生成正式密码。
-            if (SELF_TEST_STATE === 'fail') {
-                return '算法自检未通过，禁止生成密码';
+            // 自检未完成或失败时都不生成正式密码。
+            if (SELF_TEST_STATE !== 'pass') {
+                return SELF_TEST_STATE === 'fail'
+                    ? '算法自检未通过，禁止生成密码'
+                    : '算法自检进行中，请稍候';
             }
 
             // 没有主密码时直接返回提示。
@@ -3845,6 +3986,9 @@
             if (!this.currentPassword || !this.currentContext || !masterSaltManager.isMasterSaltSet()) {
                 return false;
             }
+            if (this.currentKeyEpoch !== masterSaltManager.keyEpoch) {
+                return false;
+            }
             const ctx = buildAccountContext({
                 platform: document.getElementById('platform-input').value,
                 account: document.getElementById('account-input').value,
@@ -3876,9 +4020,10 @@
 
         // 清空当前密码和上下文。
         clearCache() {
-            // V4 不做派生结果缓存；保留该方法供主密码变更时统一清理。
+            // V5 不做派生结果缓存；保留该方法供主密码变更时统一清理。
             this.currentPassword = '';
             this.currentContext = null;
+            this.currentKeyEpoch = -1;
         }
 
         // 延迟保存账户历史（不存密码）。
@@ -3954,7 +4099,7 @@
 
         // 读取选项，生成随机密码。
         generatePassword() {
-            const length = parseInt(document.getElementById('password-length-input').value) || 16;
+            let length = parseInt(document.getElementById('password-length-input').value) || 16;
             const includeNumbers = document.getElementById('include-numbers').checked;
             const includeLowercase = document.getElementById('include-lowercase').checked;
             const includeUppercase = document.getElementById('include-uppercase').checked;
@@ -4004,6 +4149,14 @@
                 document.getElementById('password-box').textContent = '请选择至少一种字符类型且长度不能为0';
                 document.getElementById('password-box').classList.remove('filled');
                 return '';
+            }
+
+            // 已选几类就至少几位；不足时静默提升。
+            const minLength = selectedSets.length;
+            if (length < minLength) {
+                length = minLength;
+                document.getElementById('password-length-input').value = length;
+                document.getElementById('password-length-slider').value = length;
             }
 
             let password = '';
@@ -4301,13 +4454,15 @@
             const verificationResult = document.getElementById('verification-result');
             const verifyButton = document.getElementById('verify-password-button');
 
-            if (SELF_TEST_STATE === 'fail') {
+            if (SELF_TEST_STATE !== 'pass') {
                 verificationResult.className = 'verification-result neutral';
-                verificationResult.innerHTML = '<span class="verification-text">算法自检未通过，禁止核对</span>';
+                verificationResult.innerHTML = '<span class="verification-text"></span>';
+                verificationResult.querySelector('.verification-text').textContent =
+                    SELF_TEST_STATE === 'fail' ? '算法自检未通过，禁止核对' : '算法自检进行中，请稍候';
                 if (isManual) {
                     verifyButton.innerHTML = '<span class="verify-icon"></span>核对密码';
                     verifyButton.classList.remove('verifying');
-                    verifyButton.disabled = false;
+                    verifyButton.disabled = true;
                 }
                 return;
             }
@@ -4490,7 +4645,15 @@
         const toggleButton = document.getElementById('themeToggle');
         const body = document.body;
 
-        const savedTheme = localStorage.getItem('theme');
+        // 存储异常时退回系统主题，不阻止后续初始化。
+        const readTheme = () => {
+            try { return localStorage.getItem('theme'); } catch (_) { return null; }
+        };
+        const writeTheme = (value) => {
+            try { localStorage.setItem('theme', value); } catch (_) {}
+        };
+
+        const savedTheme = readTheme();
         const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
 
         if (savedTheme === 'dark' || (!savedTheme && prefersDark)) {
@@ -4507,16 +4670,16 @@
             if (isCurrentlyDark) {
                 body.classList.remove('dark-mode');
                 body.classList.add('light-mode');
-                localStorage.setItem('theme', 'light');
+                writeTheme('light');
             } else {
                 body.classList.remove('light-mode');
                 body.classList.add('dark-mode');
-                localStorage.setItem('theme', 'dark');
+                writeTheme('dark');
             }
         });
 
         window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function(e) {
-            if (!localStorage.getItem('theme')) {
+            if (!readTheme()) {
                 if (e.matches) {
                     body.classList.remove('light-mode');
                     body.classList.add('dark-mode');
@@ -4717,6 +4880,7 @@
 
             accountPasswordRAF = requestAnimationFrame(async () => {
                 const seq = ++accountPasswordSeq;
+                const keyEpoch = masterSaltManager.keyEpoch;
 
                 const platform = document.getElementById('platform-input').value;
                 const account = document.getElementById('account-input').value;
@@ -4783,8 +4947,8 @@
                         platform, account, email, length, includeSpecialA, includeSpecialB, excludeSimilar
                     );
 
-                    // 只有最新请求可以更新界面，避免旧异步任务覆盖新结果。
-                    if (seq !== accountPasswordSeq) {
+                    // 只有最新请求、且主密钥代次未变的旧异步任务才可以更新界面。
+                    if (seq !== accountPasswordSeq || keyEpoch !== masterSaltManager.keyEpoch) {
                         return;
                     }
 
@@ -4805,15 +4969,17 @@
                         });
                         enhancedAccountPasswordGenerator.currentPassword = password;
                         enhancedAccountPasswordGenerator.currentContext = canonicalContext(ctx);
+                        enhancedAccountPasswordGenerator.currentKeyEpoch = keyEpoch;
                         enhancedAccountPasswordGenerator.updateDerivationInfo();
                     } else {
                         enhancedAccountPasswordGenerator.currentPassword = '';
                         enhancedAccountPasswordGenerator.currentContext = null;
+                        enhancedAccountPasswordGenerator.currentKeyEpoch = -1;
                         document.getElementById('account-iteration-info').classList.remove('visible');
                         document.getElementById('account-algorithm-info').classList.remove('visible');
                     }
                 } catch (error) {
-                    if (seq !== accountPasswordSeq) {
+                    if (seq !== accountPasswordSeq || keyEpoch !== masterSaltManager.keyEpoch) {
                         return;
                     }
                     console.error('生成账户密码错误:', error);
@@ -5172,6 +5338,21 @@
             document.getElementById('exclude-similar')
         ];
 
+        // 已选类别数决定随机密码的最低长度。
+        function syncRandomPasswordMinLength() {
+            const count = checkboxes.slice(0, 5).filter(cb => cb && cb.checked).length;
+            const min = Math.max(1, count);
+            passwordLengthSlider.min = min;
+            passwordLengthInput.min = min;
+            const current = parseInt(passwordLengthInput.value, 10) || 16;
+            if (current < min) {
+                passwordLengthInput.value = min;
+                passwordLengthSlider.value = min;
+            }
+        }
+
+        syncRandomPasswordMinLength();
+
         passwordLengthSlider.addEventListener('mousedown', function() {
             randomPasswordGenerator.isPasswordLengthDragging = true;
         });
@@ -5196,7 +5377,11 @@
 
         let passwordSliderRAF = null;
         passwordLengthSlider.addEventListener('input', function() {
-            passwordLengthInput.value = this.value;
+            let value = parseInt(this.value, 10) || 1;
+            const min = parseInt(this.min, 10) || 1;
+            if (value < min) value = min;
+            this.value = value;
+            passwordLengthInput.value = value;
 
             if (passwordSliderRAF) cancelAnimationFrame(passwordSliderRAF);
             passwordSliderRAF = requestAnimationFrame(() => {
@@ -5212,8 +5397,9 @@
         });
 
         passwordLengthInput.addEventListener('input', function() {
-            let value = parseInt(this.value) || 0;
-            if (value < 0) value = 0;
+            const min = parseInt(this.min, 10) || 1;
+            let value = parseInt(this.value) || min;
+            if (value < min) value = min;
             if (value > 256) value = 256;
             this.value = value;
             passwordLengthSlider.value = value;
@@ -5221,13 +5407,16 @@
         });
 
         clearPasswordLengthBtn.addEventListener('click', function() {
-            passwordLengthInput.value = '16';
-            passwordLengthSlider.value = 16;
+            const min = parseInt(passwordLengthInput.min, 10) || 1;
+            const value = Math.max(16, min);
+            passwordLengthInput.value = value;
+            passwordLengthSlider.value = value;
             scheduleRandomPasswordUpdateAndSave();
         });
 
         checkboxes.forEach(checkbox => {
             checkbox.addEventListener('change', function() {
+                syncRandomPasswordMinLength();
                 scheduleRandomPasswordUpdateAndSave();
             });
         });
@@ -5265,8 +5454,12 @@
         });
 
         copyAccountPasswordBtn.addEventListener('click', function() {
-            if (SELF_TEST_STATE === 'fail') {
-                messageManager.show('算法自检未通过，禁止复制密码', 'error', 3000);
+            if (SELF_TEST_STATE !== 'pass') {
+                messageManager.show(
+                    SELF_TEST_STATE === 'fail' ? '算法自检未通过，禁止复制密码' : '算法自检进行中，请稍候',
+                    'error',
+                    3000
+                );
                 return;
             }
             if (!masterSaltManager.isMasterSaltSet()) {
@@ -5305,8 +5498,12 @@
         });
 
         copyPasswordBtn.addEventListener('click', function() {
-            if (SELF_TEST_STATE === 'fail') {
-                messageManager.show('算法自检未通过，禁止复制密码', 'error', 3000);
+            if (SELF_TEST_STATE !== 'pass') {
+                messageManager.show(
+                    SELF_TEST_STATE === 'fail' ? '算法自检未通过，禁止复制密码' : '算法自检进行中，请稍候',
+                    'error',
+                    3000
+                );
                 return;
             }
             const password = document.getElementById('password-box').textContent;
@@ -5355,7 +5552,15 @@
     // 固定的虚构输入与期望密码；如果算法被意外改坏，自检会失败并提示。
     // pending：尚未跑完；pass：通过；fail：失败，禁止生成/复制/核对正式密码。
     let SELF_TEST_STATE = 'pending';
-    const SELF_TEST_MASTER_PASSWORD = 'RDCG-v4-selftest-master-2026';
+
+    // 自检未完成时禁用会产出/复制正式密码的控件。
+    function setSelfTestControlsEnabled(enabled) {
+        ['refresh-account-password', 'copy-account-password', 'verify-password-button'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.disabled = !enabled;
+        });
+    }
+    const SELF_TEST_MASTER_PASSWORD = 'RDCG-v5-selftest-master-2026';
     const SELF_TEST_VECTORS = Object.freeze([
         Object.freeze({
             platform: 'selftest.example',
@@ -5365,7 +5570,7 @@
             includeSpecialA: true,
             includeSpecialB: false,
             excludeSimilar: true,
-            expected: '4^s9^b!3E5VaMy&T'
+            expected: 'g2@V8*N4EpEd2%m!'
         }),
         Object.freeze({
             platform: 'selftest.example',
@@ -5375,7 +5580,7 @@
             includeSpecialA: true,
             includeSpecialB: true,
             excludeSimilar: true,
-            expected: 'yG+4V\\^/@2t^8Z4y\'Jp@'
+            expected: '(+)s4-9<V4qYm3XdF^/^'
         }),
         Object.freeze({
             platform: '中文自检',
@@ -5385,7 +5590,7 @@
             includeSpecialA: true,
             includeSpecialB: false,
             excludeSimilar: false,
-            expected: '^Pg0Vz#1gQ$1'
+            expected: '0l$G^GvI2)m1'
         }),
         Object.freeze({
             platform: '  selftest.example  ',
@@ -5395,7 +5600,7 @@
             includeSpecialA: true,
             includeSpecialB: false,
             excludeSimilar: true,
-            expected: '4^s9^b!3E5VaMy&T'
+            expected: 'g2@V8*N4EpEd2%m!'
         }),
         Object.freeze({
             platform: 'selftest.example',
@@ -5405,7 +5610,7 @@
             includeSpecialA: false,
             includeSpecialB: false,
             excludeSimilar: false,
-            expected: 'i0vS0V1b8Ad7iHv2ZaX0D5aR5mNr8xD3'
+            expected: '3k8R8X2kBpLo6CwC5yP8d9zAv0j3sR6A'
         }),
         Object.freeze({
             platform: 'café.example',
@@ -5415,7 +5620,7 @@
             includeSpecialA: false,
             includeSpecialB: false,
             excludeSimilar: false,
-            expected: '4wH9LrE7nP0pY5d3'
+            expected: '2Bs2ZnU9oI0vB9o5'
         }),
         Object.freeze({
             platform: 'cafe\u0301.example',
@@ -5425,17 +5630,18 @@
             includeSpecialA: false,
             includeSpecialB: false,
             excludeSimilar: false,
-            expected: '4wH9LrE7nP0pY5d3'
+            expected: '2Bs2ZnU9oI0vB9o5'
         })
     ]);
 
     // 自检失败时在右下角显示警告。
     function showSelfTestFailure(message) {
         SELF_TEST_STATE = 'fail';
-        ['refresh-account-password', 'copy-account-password', 'verify-password-button'].forEach(id => {
-            const el = document.getElementById(id);
-            if (el) el.disabled = true;
-        });
+        setSelfTestControlsEnabled(false);
+
+        if (typeof masterSaltManager !== 'undefined' && masterSaltManager) {
+            masterSaltManager.clearDerivedState();
+        }
 
         const box = document.createElement('div');
         box.textContent = '算法自检失败：请勿使用本版本生成密码';
@@ -5447,6 +5653,7 @@
     // 用固定向量检查算法是否被改坏。
     async function runSelfTest() {
         SELF_TEST_STATE = 'pending';
+        setSelfTestControlsEnabled(false);
         try {
             const rootKeyBytes = await deriveRootKey(SELF_TEST_MASTER_PASSWORD);
             const rootKey = await importRootKey(rootKeyBytes);
@@ -5469,6 +5676,15 @@
             }
 
             SELF_TEST_STATE = 'pass';
+            setSelfTestControlsEnabled(true);
+
+            // 自检通过后，按当前输入补生成/补核对一次。
+            if (typeof window.scheduleAccountPasswordUpdate === 'function') {
+                window.scheduleAccountPasswordUpdate(true);
+            }
+            if (window.passwordVerifier && masterSaltManager.isMasterSaltSet()) {
+                window.passwordVerifier.scheduleVerification();
+            }
         } catch (error) {
             showSelfTestFailure(error && error.message ? error.message : String(error));
         }
