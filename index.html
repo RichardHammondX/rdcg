@@ -2884,6 +2884,15 @@
             } catch (_) {
                 // 页面初始化阶段生成器尚未定义，忽略即可
             }
+
+            // 统一作废在途核对任务，避免旧主密钥的结果回写。
+            try {
+                if (window.passwordVerifier) {
+                    window.passwordVerifier.verificationSeq++;
+                    window.passwordVerifier.pendingReverify = false;
+                }
+            } catch (_) {}
+
             this.clearAccountPasswordUI();
         }
 
@@ -4436,6 +4445,8 @@
         async performVerification(isManual = false) {
             // 每次请求先递增序号：即使旧请求仍在执行，它的结果也会被丢弃。
             const mySeq = ++this.verificationSeq;
+            // 同时记录主密钥代次；主密钥变化后旧核对结果同样作废。
+            const keyEpoch = masterSaltManager.keyEpoch;
 
             // 当前有核对在跑时，只标记“需要重跑”，不并发启动。
             if (this.isVerifying) {
@@ -4554,8 +4565,8 @@
                     excludeSimilar
                 );
 
-                // 旧请求的结果直接丢弃，避免覆盖最新输入的状态。
-                if (mySeq !== this.verificationSeq) {
+                // 旧请求或旧主密钥的结果直接丢弃，避免覆盖当前状态。
+                if (mySeq !== this.verificationSeq || keyEpoch !== masterSaltManager.keyEpoch) {
                     return;
                 }
 
@@ -4597,7 +4608,7 @@
                     verifyButton.disabled = false;
                 }
             } catch (error) {
-                if (mySeq === this.verificationSeq) {
+                if (mySeq === this.verificationSeq && keyEpoch === masterSaltManager.keyEpoch) {
                     console.error('密码验证失败:', error);
                     verificationResult.className = 'verification-result neutral';
                     verificationResult.innerHTML = '<span class="verification-text"></span>';
@@ -5640,7 +5651,11 @@
         setSelfTestControlsEnabled(false);
 
         if (typeof masterSaltManager !== 'undefined' && masterSaltManager) {
-            masterSaltManager.clearDerivedState();
+            // 自检失败时连根密钥一起清除，而不只是清派生状态。
+            masterSaltManager.clearMasterSalt();
+        }
+        if (typeof updateMasterSaltStatus === 'function') {
+            updateMasterSaltStatus();
         }
 
         const box = document.createElement('div');
