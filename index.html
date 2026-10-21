@@ -1700,25 +1700,8 @@
             <div class="error-message" id="masterSaltError"></div>
         </div>
 
-        <div class="master-salt-remember">
-            <label class="master-salt-remember-check">
-                <input type="checkbox" id="rememberMasterSalt">
-                <span>记住我</span>
-            </label>
-            <div class="master-salt-timer" id="masterSaltTimer" style="display:none;">
-                <label>有效期</label>
-                <div class="master-salt-ttl-group">
-                    <label class="radio-option"><input type="radio" name="masterSaltTTL" value="10" checked>10分钟</label>
-                    <label class="radio-option"><input type="radio" name="masterSaltTTL" value="30">30分钟</label>
-                    <label class="radio-option"><input type="radio" name="masterSaltTTL" value="60">1小时</label>
-                    <label class="radio-option"><input type="radio" name="masterSaltTTL" value="120">2小时</label>
-                    <label class="radio-option"><input type="radio" name="masterSaltTTL" value="240">4小时</label>
-                    <label class="radio-option"><input type="radio" name="masterSaltTTL" value="forever">永久</label>
-                </div>
-            </div>
-            <div class="master-salt-risk" style="margin-top:8px;font-size:12px;line-height:1.6;color:#b45309;">
-                “记住我”只防止他人直接查看浏览器存储，不能阻止能读取本机文件的程序；开启后，能读取本机存储的程序仍可恢复根密钥。共用设备请保持关闭。
-            </div>
+        <div class="master-salt-memory-note" style="margin-top:8px;font-size:12px;line-height:1.6;color:#b45309;">
+            主密码只保存在本页内存中；关闭或刷新页面后需要重新输入。本工具不会把主密码或根密钥写入本地存储。
         </div>
 
         <div class="master-salt-hash-preview" id="masterSaltHashPreview">
@@ -2207,6 +2190,15 @@
     </div>
 </div>
 
+<!-- 历史记录开关：默认关闭，开启后才保存元数据 -->
+<div class="history-setting" style="max-width:1200px;margin:0 auto 16px;padding:0 24px;font-size:13px;color:#4b5563;text-align:center;">
+    <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="history-enabled">
+        记录历史（默认关闭）
+    </label>
+    <span style="margin-left:8px;color:#6b7280;">只保存平台、账户、邮箱、长度和选项等元数据，不保存密码；关闭后不再新增。</span>
+</div>
+
 <div class="footer">
     Made by R.H.X. ❤ With heart
 </div>
@@ -2291,8 +2283,7 @@
         // 未来如需升级，可在此统一修改并引入版本迁移逻辑。
         static SALTS = {
             CODE_GEN: 'RANDOMCODE-GEN-SALT-2024',
-            CODE_IV: 'IV-GEN',
-            MASTER_SALT_STORAGE: 'randomcode_salt_2024'
+            CODE_IV: 'IV-GEN'
         };
 
         constructor() {
@@ -2339,34 +2330,6 @@
             }
             const hash = await crypto.subtle.digest('SHA-256', data);
             return this.arrayBufferToHex(hash);
-        }
-
-        async pbkdf2(password, salt, iterations, keyLength = 256, extractable = true) {
-            const passwordBuffer = this.strToArrayBuffer(password);
-            const saltBuffer = this.strToArrayBuffer(salt);
-
-            const keyMaterial = await crypto.subtle.importKey(
-                'raw',
-                passwordBuffer,
-                'PBKDF2',
-                false,
-                ['deriveKey']
-            );
-
-            const key = await crypto.subtle.deriveKey(
-                {
-                    name: 'PBKDF2',
-                    salt: saltBuffer,
-                    iterations: Math.max(1, Math.floor(iterations)),
-                    hash: 'SHA-256'
-                },
-                keyMaterial,
-                { name: 'AES-GCM', length: keyLength },
-                extractable,
-                ['encrypt', 'decrypt']
-            );
-
-            return key;
         }
 
         clearCache() {
@@ -2596,6 +2559,7 @@
             result === '邮箱格式不正确' ||
             result === '密码长度不能为0' ||
             result.startsWith('密码长度至少需要') ||
+            result.includes('自检未通过') ||
             result.includes('失败');
     }
 
@@ -2635,7 +2599,38 @@
             }
         }
 
-        throw new Error('无法满足同类字符不相邻约束');
+        // 随机洗牌 1000 次仍失败时，用确定性构造保证可行排列。
+        // 这不会改变原本能成功生成的密码，只修复 32/64 位等低命中率组合。
+        const pools = types.map(type => ({
+            type: type,
+            chars: chars.filter(item => item.type === type)
+        }));
+        const maxCount = Math.max(...pools.map(pool => pool.chars.length));
+        if (maxCount > chars.length - maxCount + 1) {
+            throw new Error('无法满足同类字符不相邻约束');
+        }
+
+        const arranged = [];
+        let prevType = null;
+        while (arranged.length < chars.length) {
+            const candidates = pools.filter(pool => pool.chars.length > 0 && pool.type !== prevType);
+            if (candidates.length === 0) {
+                break;
+            }
+            const remainingMax = Math.max(...candidates.map(pool => pool.chars.length));
+            const tied = candidates.filter(pool => pool.chars.length === remainingMax);
+            const pick = tied.length === 1
+                ? tied[0]
+                : tied[await uniformBelow(reader, tied.length)];
+            arranged.push(pick.chars.pop());
+            prevType = pick.type;
+        }
+
+        if (arranged.length !== chars.length || hasAdjacentSameType(arranged)) {
+            throw new Error('无法满足同类字符不相邻约束');
+        }
+
+        return arranged.map(item => item.char).join('');
     }
 
     // ==================== 消息提示管理器 ====================
@@ -2703,22 +2698,22 @@
     // ==================== 主密码管理器 ====================
     class MasterSaltManager {
         constructor() {
-            // v3 保存 PBKDF2 派生出的 rootKey，而不是主密码或 SHA-512 哈希。
-            // 非永久记录放 sessionStorage：刷新保留，关闭标签页/窗口即销毁；
-            // 只有“永久”才写 localStorage。
+            // V4 起主密码只保存在本页内存中，不再写入 localStorage/sessionStorage。
+            // STORAGE_KEY / SESSION_STORAGE_KEY 仅用于清理旧版本可能留下的记录。
             this.rootKey = null;
             this.rootKeyBytes = null;
             this.STORAGE_KEY = 'randomcode_master_salt';
             this.SESSION_STORAGE_KEY = 'randomcode_master_salt_session';
-            this.DEFAULT_TTL = 10 * 60 * 1000; // 默认有效期：10 分钟
-            this.setTime = null;                // 设置时刻(毫秒)，用于失效判定
-            this.ttlMs = this.DEFAULT_TTL;      // 本次有效期时长
-            this.isPermanent = false;           // 永久记住：无有效期，永不自动失效
-            this._expiryTimer = null;            // 到期自动失效定时器
+            this.DEFAULT_TTL = 10 * 60 * 1000; // 兼容旧字段
+            this.setTime = null;                // 设置时刻(毫秒)
+            this.ttlMs = this.DEFAULT_TTL;      // 兼容旧字段
+            this.isPermanent = false;           // 内存中不自动过期（不再持久化）
+            this._expiryTimer = null;            // 兼容旧字段
 
-            // 页面卸载时清空内存中的根密钥；sessionStorage 由浏览器在标签页关闭时清除。
+            // 页面卸载时清空内存中的根密钥。
             window.addEventListener('pagehide', () => this.handlePageHide());
 
+            // 启动时只清理旧记录，不再恢复主密码。
             this.loadMasterSalt();
         }
 
@@ -2742,7 +2737,7 @@
                 throw new Error('请输入有效的字符串');
             }
 
-            // v2：主密码经 PBKDF2-HMAC-SHA-256（310,000 次）派生 256-bit 根密钥。
+            // V4：主密码经 PBKDF2-HMAC-SHA-256（310,000 次）派生 256-bit 根密钥。
             // 相同主密码 → 相同 rootKey；密码路径中不引入任何随机数。
             const rootKeyBytes = await deriveRootKey(normalized);
             const rootKey = await importRootKey(rootKeyBytes);
@@ -2803,190 +2798,10 @@
             }
         }
 
-        // 用随机指纹派生密钥，加密根密钥后写入存储。
-        async encryptData(dataBytes, fingerPrint) {
-            try {
-                const key = await cryptoUtils.pbkdf2(
-                    fingerPrint,
-                    CryptoUtils.SALTS.MASTER_SALT_STORAGE,
-                    100000,
-                    256
-                );
-
-                // 每次加密生成随机 12 字节 IV（AES-GCM 要求 IV 随机且唯一）。
-                // 该随机数只影响存储密文，不进入密码派生路径。
-                const iv = crypto.getRandomValues(new Uint8Array(12));
-
-                const encrypted = await crypto.subtle.encrypt(
-                    {
-                        name: 'AES-GCM',
-                        iv: iv,
-                        tagLength: 128
-                    },
-                    key,
-                    dataBytes
-                );
-
-                // 返回 base64：随机IV + 密文
-                return {
-                    iv: btoa(String.fromCharCode(...iv)),
-                    data: btoa(String.fromCharCode(...new Uint8Array(encrypted)))
-                };
-            } catch (error) {
-                console.error('加密失败:', error);
-                throw new Error('数据加密失败');
-            }
-        }
-
-        // 用同一指纹解密，恢复根密钥字节。
-        async decryptData(payload, fingerPrint) {
-            try {
-                const iv = Uint8Array.from(atob(payload.iv), c => c.charCodeAt(0));
-                const encryptedBytes = Uint8Array.from(atob(payload.data), c => c.charCodeAt(0));
-
-                const key = await cryptoUtils.pbkdf2(
-                    fingerPrint,
-                    CryptoUtils.SALTS.MASTER_SALT_STORAGE,
-                    100000,
-                    256
-                );
-
-                const decrypted = await crypto.subtle.decrypt(
-                    {
-                        name: 'AES-GCM',
-                        iv: iv,
-                        tagLength: 128
-                    },
-                    key,
-                    encryptedBytes
-                );
-
-                return new Uint8Array(decrypted);
-            } catch (error) {
-                console.error('解密失败:', error);
-                return null;
-            }
-        }
-
-        // 非永久记录放 sessionStorage，永久记录放 localStorage。
-        async saveMasterSalt(rememberMe = false, ttlMs = this.ttlMs) {
-            // 没有根密钥时不保存。
-            if (!this.rootKeyBytes) {
-                return false;
-            }
-
-            try {
-                // 先清除旧记录，避免会话/永久两种存储同时存在。
-                this.removeStoredMasterSalt();
-
-                if (!rememberMe) {
-                    return true;
-                }
-
-                // 每次保存生成随机 fingerprint，与密文一并存储；
-                // 该随机数只用于存储加密，不影响解密后恢复的 rootKey。
-                const fingerPrint = Array.from(crypto.getRandomValues(new Uint8Array(16)))
-                    .map(b => b.toString(16).padStart(2, '0')).join('');
-                const payload = await this.encryptData(this.rootKeyBytes, fingerPrint);
-                const record = JSON.stringify({
-                    v: RDCG.VERSION,
-                    fp: fingerPrint,
-                    encrypted: payload,
-                    setTime: this.setTime,
-                    ttl: this.isPermanent ? null : ttlMs,
-                    permanent: this.isPermanent,
-                    timestamp: Date.now()
-                });
-
-                // 永久 → localStorage；非永久 → sessionStorage（关闭标签页即销毁）。
-                if (this.isPermanent) {
-                    localStorage.setItem(this.STORAGE_KEY, record);
-                } else {
-                    sessionStorage.setItem(this.SESSION_STORAGE_KEY, record);
-                }
-
-                return true;
-            } catch (error) {
-                console.error('保存主密码失败:', error);
-                return false;
-            }
-        }
-
-        // 先从会话存储找，再找永久存储。
+        // V4 起主密码只保存在内存中；启动时只清理旧版本可能留下的记录。
         async loadMasterSalt() {
-            try {
-                // 非永久记录在 sessionStorage（刷新保留，关闭标签页销毁）；
-                // 永久记录在 localStorage。
-                let storedData = null;
-                let isSessionRecord = false;
-
-                try {
-                    storedData = sessionStorage.getItem(this.SESSION_STORAGE_KEY);
-                    isSessionRecord = storedData !== null;
-                } catch (_) {
-                    storedData = null;
-                }
-
-                if (!storedData) {
-                    storedData = localStorage.getItem(this.STORAGE_KEY);
-                    isSessionRecord = false;
-                }
-
-                if (!storedData) {
-                    return false;
-                }
-
-                const parsed = JSON.parse(storedData);
-                if (!parsed || !parsed.encrypted || !parsed.fp) {
-                    this.removeStoredMasterSalt();
-                    return false;
-                }
-
-                // 旧版本（V1/V2）记录与当前 rootKey 派生不兼容，直接丢弃。
-                if (parsed.v !== RDCG.VERSION) {
-                    this.removeStoredMasterSalt();
-                    return false;
-                }
-
-                const permanent = parsed.permanent === true;
-
-                // v3 只允许“永久”记录放在 localStorage；
-                // 旧 V2 的非永久 localStorage 记录直接删除，避免跨会话残留。
-                if (!isSessionRecord && !permanent) {
-                    localStorage.removeItem(this.STORAGE_KEY);
-                    return false;
-                }
-
-                // 有效期校验：从设置时刻起算，超过所选时长即失效（永久记住项跳过校验）
-                const setTime = parsed.setTime ? Number(parsed.setTime) : 0;
-                const ttl = (parsed.ttl && parsed.ttl > 0) ? Number(parsed.ttl) : this.DEFAULT_TTL;
-                if (!permanent && (!setTime || Date.now() - setTime > ttl)) {
-                    this.removeStoredMasterSalt();
-                    return false;
-                }
-
-                const decryptedRootKey = await this.decryptData(parsed.encrypted, parsed.fp);
-                if (decryptedRootKey && decryptedRootKey.length === 32) {
-                    this.rootKeyBytes = decryptedRootKey;
-                    this.rootKey = await importRootKey(decryptedRootKey);
-                    this.setTime = setTime;
-                    this.isPermanent = permanent;
-                    if (permanent) {
-                        this.ttlMs = null;
-                        this.stopExpiryTimer();
-                    } else {
-                        this.ttlMs = ttl;
-                        this.startExpiryTimer();
-                    }
-                    return true;
-                }
-
-                this.removeStoredMasterSalt();
-                return false;
-            } catch (error) {
-                console.error('加载主密码失败:', error);
-                return false;
-            }
+            this.removeStoredMasterSalt();
+            return false;
         }
 
         // 清除主密码：内存、两种存储、界面一起清。
@@ -3126,17 +2941,6 @@
             this.modalOverlay = document.getElementById('masterSaltModalOverlay');
             this.modal = document.getElementById('masterSaltModal');
             this.masterSaltInput = document.getElementById('masterSaltInput');
-            this.rememberCheckbox = document.getElementById('rememberMasterSalt');
-            this.ttlRadios = document.querySelectorAll('input[name="masterSaltTTL"]');
-            this.ttlRadios.forEach(r => {
-                r.addEventListener('change', () => {
-                    this.ttlRadios.forEach(x => x.closest('.radio-option').classList.toggle('selected', x.checked));
-                });
-                if (r.checked) {
-                    r.closest('.radio-option').classList.add('selected');
-                }
-            });
-            this.timerGroup = document.getElementById('masterSaltTimer');
             this.hashPreview = document.getElementById('masterSaltHashPreview');
             this.hashValue = document.getElementById('masterSaltHashValue');
             this.checkTimer = null;   // 校验值防抖定时器
@@ -3160,12 +2964,6 @@
             this.cancelButton.addEventListener('click', () => {
                 this.hide();
             });
-
-            // 勾选"记住我"时显示有效期下拉，否则隐藏
-            this.rememberCheckbox.addEventListener('change', () => {
-                this.timerGroup.style.display = this.rememberCheckbox.checked ? '' : 'none';
-            });
-            this.timerGroup.style.display = this.rememberCheckbox.checked ? '' : 'none';
 
             this.clearButton.addEventListener('click', () => {
                 this.handleClear();
@@ -3204,20 +3002,18 @@
             return true;
         }
 
-        // 输入停止 500ms 后再计算校验值。
+        // 输入一变化就立即让旧计算失效，再防抖 500ms 计算新值。
         scheduleCheckValue() {
-            // 输入停止 500ms 后再计算，避免每按一个键都跑 PBKDF2
+            const seq = ++this.checkSeq;
             clearTimeout(this.checkTimer);
             this.checkTimer = setTimeout(() => {
-                this.computeCheckValue(this.masterSaltInput.value.trim());
+                this.computeCheckValue(this.masterSaltInput.value.trim(), seq);
             }, 500);
         }
 
         // 用 rootKey 派生校验值，只显示头尾。
-        async computeCheckValue(input) {
-            // 序号用于丢弃过期结果，防止旧输入的计算覆盖新输入
-            const seq = ++this.checkSeq;
-
+        async computeCheckValue(input, seq) {
+            // 序号由 scheduleCheckValue 传入；输入一变化，旧任务立即失效
             if (!input || input.length < 12) {
                 this.hashPreview.classList.remove('visible');
                 this.hashValue.textContent = '';
@@ -3253,42 +3049,32 @@
         // 点击“设置主密码”后的完整流程。
         async handleConfirm() {
             const input = this.masterSaltInput.value.trim();
-            const rememberMe = this.rememberCheckbox.checked;
-            const checkedTtl = document.querySelector('input[name="masterSaltTTL"]:checked');
-            const permanent = !!(checkedTtl && checkedTtl.value === 'forever');
-            const ttlMin = (!permanent && checkedTtl) ? parseInt(checkedTtl.value, 10) : 10;
-            const ttlMs = ttlMin * 60 * 1000;
 
             if (!this.validateInput()) {
                 return;
             }
 
             try {
-                await masterSaltManager.setMasterPassword(input, ttlMs, permanent);
+                // V4 起主密码只保存在内存中；不写入 localStorage/sessionStorage。
+                await masterSaltManager.setMasterPassword(input, 0, true);
 
-                const saved = await masterSaltManager.saveMasterSalt(rememberMe, ttlMs);
+                updateMasterSaltStatus();
 
-                if (saved) {
-                    updateMasterSaltStatus();
+                const platform = document.getElementById('platform-input').value;
+                const account = document.getElementById('account-input').value;
 
-                    const platform = document.getElementById('platform-input').value;
-                    const account = document.getElementById('account-input').value;
-
-                    if (platform && account) {
-                        if (window.scheduleAccountPasswordUpdate) {
-                            window.scheduleAccountPasswordUpdate();
-                        }
+                if (platform && account) {
+                    if (window.scheduleAccountPasswordUpdate) {
+                        window.scheduleAccountPasswordUpdate();
                     }
-
-                    if (window.passwordVerifier && masterSaltManager.isMasterSaltSet()) {
-                        window.passwordVerifier.scheduleVerification();
-                    }
-
-                    messageManager.show('主密码设置成功！', 'success', 3000);
-                    this.hide();
-                } else {
-                    messageManager.show('保存主密码失败', 'error', 3000);
                 }
+
+                if (window.passwordVerifier && masterSaltManager.isMasterSaltSet()) {
+                    window.passwordVerifier.scheduleVerification();
+                }
+
+                messageManager.show('主密码设置成功！', 'success', 3000);
+                this.hide();
             } catch (error) {
                 console.error('设置主密码失败:', error);
                 messageManager.show(`设置主密码失败: ${error.message}`, 'error', 3000);
@@ -3380,8 +3166,27 @@
             };
 
             this.MAX_HISTORY_ITEMS = 500;
+            this.ENABLED_KEY = 'randomcode_history_enabled';
 
             // 按用户决定：不迁移、不删除旧历史；旧记录原样保留。
+        }
+
+        // 历史记录默认关闭；只有用户显式开启后才写入存储。
+        isEnabled() {
+            try {
+                return localStorage.getItem(this.ENABLED_KEY) === 'true';
+            } catch (_) {
+                return false;
+            }
+        }
+
+        // 用户切换历史记录开关。
+        setEnabled(value) {
+            try {
+                localStorage.setItem(this.ENABLED_KEY, value ? 'true' : 'false');
+            } catch (_) {
+                // 存储不可用时保持关闭更安全
+            }
         }
 
         // 优先 localStorage，失败后退到 sessionStorage/内存。
@@ -3495,6 +3300,11 @@
 
         // 新记录放在最前面，并生成 id/时间。
         addHistoryItem(storageKey, item) {
+            // 历史默认关闭；用户开启后才写入。
+            if (!this.isEnabled()) {
+                return false;
+            }
+
             try {
                 const history = this.getHistory(storageKey);
 
@@ -3976,9 +3786,14 @@
             this.isSavingHistory = false;
         }
 
-        // v2 唯一生成入口：输入规范化 → 上下文编码 → HMAC 字节流 → 无偏采样。
+        // V4 唯一生成入口：输入规范化 → 上下文编码 → HMAC 字节流 → 无偏采样。
         // 校验输入并生成账户密码。
         async generatePassword(platform, account, email, length, includeSpecialA, includeSpecialB, excludeSimilar) {
+            // 自检失败时禁止生成正式密码。
+            if (SELF_TEST_STATE === 'fail') {
+                return '算法自检未通过，禁止生成密码';
+            }
+
             // 没有主密码时直接返回提示。
             if (!masterSaltManager.isMasterSaltSet()) {
                 return '请先设置主密码';
@@ -4061,7 +3876,7 @@
 
         // 清空当前密码和上下文。
         clearCache() {
-            // v3 不做派生结果缓存；保留该方法供主密码变更时统一清理。
+            // V4 不做派生结果缓存；保留该方法供主密码变更时统一清理。
             this.currentPassword = '';
             this.currentContext = null;
         }
@@ -4194,36 +4009,49 @@
             let password = '';
 
             try {
-                // 字符选择与洗牌各用一组独立随机字节，避免同一随机值被复用
-                const charRandomValues = new Uint8Array(length);
-                const shuffleRandomValues = new Uint8Array(length);
-                crypto.getRandomValues(charRandomValues);
-                crypto.getRandomValues(shuffleRandomValues);
+                // 用 CSPRNG 字节流做拒绝采样，消除 % 取模偏差
+                let randomBuffer = new Uint8Array(0);
+                let randomOffset = 0;
+                const nextRandomByte = () => {
+                    if (randomOffset >= randomBuffer.length) {
+                        randomBuffer = new Uint8Array(32);
+                        crypto.getRandomValues(randomBuffer);
+                        randomOffset = 0;
+                    }
+                    return randomBuffer[randomOffset++];
+                };
+                const randomBelow = (n) => {
+                    const limit = 256 - (256 % n);
+                    for (;;) {
+                        const byte = nextRandomByte();
+                        if (byte < limit) return byte % n;
+                    }
+                };
 
                 if (length >= selectedSets.length) {
                     const passwordArray = [];
 
                     for (let i = 0; i < selectedSets.length; i++) {
-                        const randIndex = charRandomValues[i] % selectedSets[i].length;
+                        const randIndex = randomBelow(selectedSets[i].length);
                         passwordArray.push(selectedSets[i][randIndex]);
                     }
 
                     if (passwordArray.length < length) {
                         for (let i = passwordArray.length; i < length; i++) {
-                            const randIndex = charRandomValues[i] % charset.length;
+                            const randIndex = randomBelow(charset.length);
                             passwordArray.push(charset[randIndex]);
                         }
                     }
 
                     for (let i = passwordArray.length - 1; i > 0; i--) {
-                        const j = shuffleRandomValues[i] % (i + 1);
+                        const j = randomBelow(i + 1);
                         [passwordArray[i], passwordArray[j]] = [passwordArray[j], passwordArray[i]];
                     }
 
                     password = passwordArray.slice(0, length).join('');
                 } else {
                     for (let i = 0; i < length; i++) {
-                        const randIndex = charRandomValues[i] % charset.length;
+                        const randIndex = randomBelow(charset.length);
                         password += charset[randIndex];
                     }
                 }
@@ -4472,6 +4300,17 @@
             const noMasterSaltMessage = document.getElementById('no-master-salt-message');
             const verificationResult = document.getElementById('verification-result');
             const verifyButton = document.getElementById('verify-password-button');
+
+            if (SELF_TEST_STATE === 'fail') {
+                verificationResult.className = 'verification-result neutral';
+                verificationResult.innerHTML = '<span class="verification-text">算法自检未通过，禁止核对</span>';
+                if (isManual) {
+                    verifyButton.innerHTML = '<span class="verify-icon"></span>核对密码';
+                    verifyButton.classList.remove('verifying');
+                    verifyButton.disabled = false;
+                }
+                return;
+            }
 
             if (isManual) {
                 const originalButtonText = verifyButton.innerHTML;
@@ -4833,6 +4672,16 @@
         initThemeToggle();
         updateMasterSaltStatus();
         initHistoryPanels();
+
+        // 初始化“记录历史”开关：默认关闭，用户手动开启后才写入。
+        const historyEnabledCheckbox = document.getElementById('history-enabled');
+        if (historyEnabledCheckbox) {
+            historyEnabledCheckbox.checked = historyManager.isEnabled();
+            historyEnabledCheckbox.addEventListener('change', function() {
+                historyManager.setEnabled(this.checked);
+                messageManager.show(this.checked ? '历史记录已开启' : '历史记录已关闭', 'info', 2500);
+            });
+        }
         // 启动时尝试恢复主密码(含有效期校验)，无效则主动弹出设置框
         masterSaltManager.ensureAvailableOnStartup();
         passwordVerifier.initEventListeners();
@@ -5416,6 +5265,10 @@
         });
 
         copyAccountPasswordBtn.addEventListener('click', function() {
+            if (SELF_TEST_STATE === 'fail') {
+                messageManager.show('算法自检未通过，禁止复制密码', 'error', 3000);
+                return;
+            }
             if (!masterSaltManager.isMasterSaltSet()) {
                 messageManager.show('主密码已失效，请重新设置', 'error', 3000);
                 return;
@@ -5452,6 +5305,10 @@
         });
 
         copyPasswordBtn.addEventListener('click', function() {
+            if (SELF_TEST_STATE === 'fail') {
+                messageManager.show('算法自检未通过，禁止复制密码', 'error', 3000);
+                return;
+            }
             const password = document.getElementById('password-box').textContent;
             const originalHTML = this.innerHTML;
 
@@ -5496,6 +5353,8 @@
 
     // ==================== 无感知算法自检 ====================
     // 固定的虚构输入与期望密码；如果算法被意外改坏，自检会失败并提示。
+    // pending：尚未跑完；pass：通过；fail：失败，禁止生成/复制/核对正式密码。
+    let SELF_TEST_STATE = 'pending';
     const SELF_TEST_MASTER_PASSWORD = 'RDCG-v4-selftest-master-2026';
     const SELF_TEST_VECTORS = Object.freeze([
         Object.freeze({
@@ -5527,11 +5386,57 @@
             includeSpecialB: false,
             excludeSimilar: false,
             expected: '^Pg0Vz#1gQ$1'
+        }),
+        Object.freeze({
+            platform: '  selftest.example  ',
+            account: '  alice  ',
+            email: '',
+            length: 16,
+            includeSpecialA: true,
+            includeSpecialB: false,
+            excludeSimilar: true,
+            expected: '4^s9^b!3E5VaMy&T'
+        }),
+        Object.freeze({
+            platform: 'selftest.example',
+            account: 'carol',
+            email: '',
+            length: 32,
+            includeSpecialA: false,
+            includeSpecialB: false,
+            excludeSimilar: false,
+            expected: 'i0vS0V1b8Ad7iHv2ZaX0D5aR5mNr8xD3'
+        }),
+        Object.freeze({
+            platform: 'café.example',
+            account: 'nfc',
+            email: '',
+            length: 16,
+            includeSpecialA: false,
+            includeSpecialB: false,
+            excludeSimilar: false,
+            expected: '4wH9LrE7nP0pY5d3'
+        }),
+        Object.freeze({
+            platform: 'cafe\u0301.example',
+            account: 'nfc',
+            email: '',
+            length: 16,
+            includeSpecialA: false,
+            includeSpecialB: false,
+            excludeSimilar: false,
+            expected: '4wH9LrE7nP0pY5d3'
         })
     ]);
 
     // 自检失败时在右下角显示警告。
     function showSelfTestFailure(message) {
+        SELF_TEST_STATE = 'fail';
+        ['refresh-account-password', 'copy-account-password', 'verify-password-button'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.disabled = true;
+        });
+
         const box = document.createElement('div');
         box.textContent = '算法自检失败：请勿使用本版本生成密码';
         box.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:99999;background:#b91c1c;color:#fff;padding:10px 14px;border-radius:8px;font-size:13px;box-shadow:0 4px 12px rgba(0,0,0,.2);';
@@ -5541,6 +5446,7 @@
 
     // 用固定向量检查算法是否被改坏。
     async function runSelfTest() {
+        SELF_TEST_STATE = 'pending';
         try {
             const rootKeyBytes = await deriveRootKey(SELF_TEST_MASTER_PASSWORD);
             const rootKey = await importRootKey(rootKeyBytes);
@@ -5561,6 +5467,8 @@
                     return;
                 }
             }
+
+            SELF_TEST_STATE = 'pass';
         } catch (error) {
             showSelfTestFailure(error && error.message ? error.message : String(error));
         }
