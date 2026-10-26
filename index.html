@@ -2281,13 +2281,10 @@
 
     // ==================== 通用工具类 ====================
     class CryptoUtils {
-        // ========== [修复#10] 集中管理加密 salt 常量 ==========
-        // 说明：这些 salt 值保持不变以保证既有密码/编码的派生结果可复现。
-        // 出于纯客户端、无网络传输的场景，硬编码 salt 的攻击面有限；
-        // 未来如需升级，可在此统一修改并引入版本迁移逻辑。
+        // 集中管理编码模块的固定 salt 常量。
+        // 固定 salt 不是秘密，只用于跨设备复现；熵来自用户输入的密钥。
         static SALTS = {
-            CODE_GEN: 'RANDOMCODE-GEN-SALT-2024',
-            CODE_IV: 'IV-GEN'
+            CODE_GEN: 'RANDOMCODE-GEN-SALT-2024'
         };
 
         constructor() {
@@ -2652,10 +2649,9 @@
     // ==================== 主密码管理器 ====================
     class MasterSaltManager {
         constructor() {
-            // V5 起主密码只保存在本页内存中，不再写入 localStorage/sessionStorage。
+            // V6 起主密码只保存在本页内存中，不再写入 localStorage/sessionStorage。
             // STORAGE_KEY / SESSION_STORAGE_KEY 仅用于清理旧版本可能留下的记录。
             this.rootKey = null;
-            this.rootKeyBytes = null;
             this.STORAGE_KEY = 'randomcode_master_salt';
             this.SESSION_STORAGE_KEY = 'randomcode_master_salt_session';
             this.DEFAULT_TTL = 10 * 60 * 1000; // 兼容旧字段
@@ -2683,11 +2679,14 @@
         // 页面关闭/刷新时清空内存中的根密钥。
         handlePageHide() {
             this.rootKey = null;
-            this.rootKeyBytes = null;
             this.stopExpiryTimer();
 
-            // 作废旧生成/核对结果，并清空敏感输入。
+            // 作废旧生成/核对结果，并清空敏感输入与编码缓存。
             this.clearDerivedState();
+            cryptoUtils.clearCache();
+            if (window.codeGenerator) {
+                window.codeGenerator.invalidateResult();
+            }
             const verifyPassword = document.getElementById('verify-password-input');
             if (verifyPassword) {
                 verifyPassword.value = '';
@@ -2707,7 +2706,7 @@
                 throw new Error('请输入有效的字符串');
             }
 
-            // V5：主密码经 PBKDF2-HMAC-SHA-256（310,000 次）派生 256-bit 根密钥。
+            // V6：主密码经 PBKDF2-HMAC-SHA-256（310,000 次）派生 256-bit 根密钥。
             // 相同主密码 → 相同 rootKey；密码路径中不引入任何随机数。
             const rootKeyBytes = await deriveRootKey(normalized);
             const rootKey = await importRootKey(rootKeyBytes);
@@ -2779,7 +2778,7 @@
             }
         }
 
-        // V5 起主密码只保存在内存中；启动时只清理旧版本可能留下的记录。
+        // V6 起主密码只保存在内存中；启动时只清理旧版本可能留下的记录。
         async loadMasterSalt() {
             this.removeStoredMasterSalt();
             return false;
@@ -2789,7 +2788,6 @@
         clearMasterSalt() {
             this.stopExpiryTimer();
             this.rootKey = null;
-            this.rootKeyBytes = null;
             this.setTime = null;
             this.ttlMs = this.DEFAULT_TTL;
             this.isPermanent = false;
@@ -2821,7 +2819,6 @@
             this._expiryTimer = null;
             const had = this.rootKey !== null;
             this.rootKey = null;
-            this.rootKeyBytes = null;
             this.setTime = null;
             this.ttlMs = this.DEFAULT_TTL;
             this.isPermanent = false;
@@ -3008,34 +3005,46 @@
             this.hashPreview.classList.add('visible');
             this.hashValue.textContent = '计算中…';
 
+            let rootKeyBytes = null;
             try {
-                const rootKeyBytes = await deriveRootKey(input);
+                rootKeyBytes = await deriveRootKey(input);
                 if (seq !== this.checkSeq) return;
 
                 const rootKey = await importRootKey(rootKeyBytes);
                 rootKeyBytes.fill(0);
                 if (seq !== this.checkSeq) return;
 
-                const signature = await crypto.subtle.sign(
-                    'HMAC',
-                    rootKey,
-                    cryptoUtils.strToArrayBuffer('RDCG-v6|master-check-number')
-                );
-                if (seq !== this.checkSeq) return;
+                // 拒绝采样失败时继续派生下一块，不使用有偏回退。
+                for (let counter = 0; counter < 10000; counter++) {
+                    const domain = counter === 0
+                        ? 'RDCG-v6|master-check-number'
+                        : `RDCG-v6|master-check-number|${counter}`;
+                    const signature = await crypto.subtle.sign(
+                        'HMAC',
+                        rootKey,
+                        cryptoUtils.strToArrayBuffer(domain)
+                    );
+                    if (seq !== this.checkSeq) return;
 
-                // 两个字节一组做拒绝采样：0–65499 均匀映射到 1–100。
-                const bytes = new Uint8Array(signature);
-                for (let i = 0; i + 1 < bytes.length; i += 2) {
-                    const value = (bytes[i] << 8) | bytes[i + 1];
-                    if (value < 65500) {
-                        this.hashValue.textContent = String((value % 100) + 1);
-                        return;
+                    // 两个字节一组做拒绝采样：0–65499 均匀映射到 1–100。
+                    const bytes = new Uint8Array(signature);
+                    for (let i = 0; i + 1 < bytes.length; i += 2) {
+                        const value = (bytes[i] << 8) | bytes[i + 1];
+                        if (value < 65500) {
+                            this.hashValue.textContent = String((value % 100) + 1);
+                            return;
+                        }
                     }
                 }
-                this.hashValue.textContent = String((bytes[0] % 100) + 1);
+                throw new Error('识别码计算失败');
             } catch (error) {
                 if (seq === this.checkSeq) {
                     this.hashValue.textContent = '计算失败';
+                }
+            } finally {
+                // 无论正常返回、序号失效还是异常，都清空临时字节。
+                if (rootKeyBytes) {
+                    rootKeyBytes.fill(0);
                 }
             }
         }
@@ -3058,7 +3067,7 @@
             this.confirmButton.disabled = true;
 
             try {
-                // V5 起主密码只保存在内存中；不写入 localStorage/sessionStorage。
+                // V6 起主密码只保存在内存中；不写入 localStorage/sessionStorage。
                 await masterSaltManager.setMasterPassword(input, 0, true);
 
                 // 派生期间输入变化、取消或关闭都会使序号失效。
@@ -3553,8 +3562,6 @@
     // ==================== 功能块3：编码生成器 ====================
     class CodeGenerator {
         constructor() {
-            this.lastOri = '';
-            this.lastPwd = '';
             this.fullResult = '';
             this.resultContext = null;
             this.requestSeq = 0;
@@ -3565,13 +3572,32 @@
             this.isSavingHistory = false;
         }
 
-        // 清空当前结果并使在途请求失效；刷新按钮使用。
-        resetResult() {
+        // 作废当前结果，但不清理缓存。
+        invalidateResult() {
             this.requestSeq++;
             this.resultContext = null;
             this.fullResult = '';
-            this.lastOri = '';
-            this.lastPwd = '';
+        }
+
+        // 清空当前结果并使在途请求失效；刷新按钮使用。
+        resetResult() {
+            this.invalidateResult();
+        }
+
+        // 编码结果缓存：键已哈希，不保存原文或密钥。
+        clearCache() {
+            Array.from(cryptoUtils.cache.keys())
+                .filter(key => key.startsWith('["fullcode"'))
+                .forEach(key => cryptoUtils.cache.delete(key));
+        }
+
+        // 用结构化输入的 SHA-256 作为缓存键，避免把原文/密钥写进键名。
+        async getCacheKey(ori, pwd) {
+            const digest = await crypto.subtle.digest(
+                'SHA-256',
+                cryptoUtils.strToArrayBuffer(JSON.stringify([ori, pwd]))
+            );
+            return JSON.stringify(['fullcode', cryptoUtils.arrayBufferToHex(digest)]);
         }
 
         // 缓存编码中间值，并按前缀限制条目数。
@@ -3583,13 +3609,8 @@
             }
         }
 
-        // 用密钥做 PBKDF2，派生编码用的 HMAC 密钥。
+        // 用密钥做 PBKDF2，派生编码用的 HMAC 密钥；不做长期缓存。
         async deriveCodeKey(pwd) {
-            const cacheKey = JSON.stringify(['code_key', pwd]);
-            if (cryptoUtils.cache.has(cacheKey)) {
-                return cryptoUtils.cache.get(cacheKey);
-            }
-
             const keyMaterial = await crypto.subtle.importKey(
                 'raw',
                 cryptoUtils.strToArrayBuffer(pwd),
@@ -3612,7 +3633,6 @@
                 ['sign']
             );
 
-            this.cacheCodeEntry(cacheKey, key, '["code_key"', 20);
             return key;
         }
 
@@ -3620,7 +3640,7 @@
         async generateFullCode(ori, pwd) {
             if (!ori || !pwd) return '';
 
-            const cacheKey = JSON.stringify(['fullcode', ori, pwd]);
+            const cacheKey = await this.getCacheKey(ori, pwd);
 
             if (cryptoUtils.pendingCalculations.has(cacheKey)) {
                 return cryptoUtils.pendingCalculations.get(cacheKey);
@@ -3645,7 +3665,7 @@
                         );
                         const result = cryptoUtils.arrayBufferToHex(signature).toUpperCase();
 
-                        this.cacheCodeEntry(cacheKey, result, '["fullcode"', 50);
+                        this.cacheCodeEntry(cacheKey, result, '["fullcode"', 20);
                         return result;
                     } finally {
                         cryptoUtils.pendingCalculations.delete(cacheKey);
@@ -3699,8 +3719,6 @@
             }
 
             this.isCalculating = true;
-            this.lastOri = ori;
-            this.lastPwd = pwd;
 
             document.getElementById('result-box').textContent = '计算中...';
             document.getElementById('result-box').classList.remove('filled');
@@ -3800,6 +3818,7 @@
     }
 
     const codeGenerator = new CodeGenerator();
+    window.codeGenerator = codeGenerator;
 
     // ==================== 功能块1：增强的账户密码生成器 ====================
     class EnhancedAccountPasswordGenerator {
@@ -3811,7 +3830,7 @@
             this.isSavingHistory = false;
         }
 
-        // V5 唯一生成入口：输入规范化 → 上下文编码 → HMAC 字节流 → 无偏采样。
+        // V6 唯一生成入口：输入规范化 → 上下文编码 → HMAC 字节流 → 无偏采样。
         // 校验输入并生成账户密码。
         async generatePassword(platform, account, email, length, includeSpecialA, includeSpecialB, excludeSimilar) {
             // 自检未完成或失败时都不生成正式密码。
@@ -3906,7 +3925,7 @@
 
         // 清空当前密码和上下文。
         clearCache() {
-            // V5 不做派生结果缓存；保留该方法供主密码变更时统一清理。
+            // V6 不做派生结果缓存；保留该方法供主密码变更时统一清理。
             this.currentPassword = '';
             this.currentContext = null;
             this.currentKeyEpoch = -1;
@@ -4343,7 +4362,6 @@
             const email = document.getElementById('verify-email-input').value.trim();
             const password = document.getElementById('verify-password-input').value;
             const autoDetectSpecial = document.getElementById('verify-include-special-auto').checked;
-            const manualOverrideSpecial = document.getElementById('verify-include-special-override').checked;
             const excludeSimilar = document.getElementById('verify-exclude-similar') ? document.getElementById('verify-exclude-similar').checked : true;
             const noMasterSaltMessage = document.getElementById('no-master-salt-message');
             const verificationResult = document.getElementById('verification-result');
@@ -4947,6 +4965,10 @@
                 errorMessage: '请输入原始文本'
             });
 
+            // 输入一变，旧结果和缓存都不再需要。
+            codeGenerator.invalidateResult();
+            codeGenerator.clearCache();
+
             clearTimeout(codeTimeout);
             codeTimeout = setTimeout(() => {
                 scheduleCodeUpdate();
@@ -4961,6 +4983,10 @@
                 errorMessage: '请输入密钥'
             });
 
+            // 输入一变，旧结果和缓存都不再需要。
+            codeGenerator.invalidateResult();
+            codeGenerator.clearCache();
+
             clearTimeout(codeTimeout);
             codeTimeout = setTimeout(() => {
                 scheduleCodeUpdate();
@@ -4970,14 +4996,16 @@
         clearOriBtn.addEventListener('click', function() {
             oriInput.value = '';
             InputValidator.clearError(oriInput);
-            codeGenerator.lastOri = '';
+            codeGenerator.invalidateResult();
+            codeGenerator.clearCache();
             scheduleCodeUpdate();
         });
 
         clearPwdBtn.addEventListener('click', function() {
             pwdInput.value = '';
             InputValidator.clearError(pwdInput);
-            codeGenerator.lastPwd = '';
+            codeGenerator.invalidateResult();
+            codeGenerator.clearCache();
             scheduleCodeUpdate();
         });
 
@@ -5178,9 +5206,11 @@
 
         // 自定义数字框手动输入
         accountCustomDisplay.addEventListener('change', function() {
+            const min = parseInt(accountCustomDisplay.min, 10) || 1;
+            const max = parseInt(accountCustomDisplay.max, 10) || 256;
             let v = parseInt(this.value, 10);
-            if (isNaN(v) || v < 1) v = 1;
-            if (v > 256) v = 256;
+            if (isNaN(v) || v < min) v = min;
+            if (v > max) v = max;
             this.value = v;
             if (String(accountCustomSlider.value) !== String(v)) accountCustomSlider.value = v;
             accountPasswordLengthInput.value = v;
