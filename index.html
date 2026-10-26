@@ -2542,8 +2542,7 @@
             result.includes('失败');
     }
 
-    // 从站点密钥派生字符流，按配额选字并洗牌，直到同类字符不相邻。
-    // V6：从当前允许的完整字符集合中无重复抽取，并保证每个启用类别至少出现一次。
+    // V6：按轮从完整字符池无放回抽取；池耗尽后用同一字节流重新洗牌。
     async function generateDeterministicPassword(ctx, rootKey) {
         const types = ['numbers', 'lowercase', 'uppercase'];
         if (ctx.includeSpecialA) types.push('specialA');
@@ -2560,22 +2559,29 @@
         if (!Number.isInteger(ctx.length) || ctx.length < types.length) {
             throw new Error(`密码长度至少需要 ${types.length} 位`);
         }
-        if (ctx.length > pool.length) {
-            throw new Error(`密码长度不能超过当前字符集容量 ${pool.length} 位`);
+        if (ctx.length > 256) {
+            throw new Error('密码长度不能超过 256 位');
         }
 
         const siteKey = await deriveSiteKey(rootKey, ctx);
         const reader = new DeterministicByteReader(siteKey);
         const requiredTypes = new Set(types);
 
-        // 全字符集 Fisher–Yates 洗牌，取前 L 个；缺少类别时继续用同一字节流重洗。
+        // 每轮洗乱整个字符池：轮内不重复，池耗尽后继续用同一字节流重洗。
         for (let attempt = 0; attempt < 10000; attempt++) {
-            const shuffled = pool.slice();
-            for (let i = shuffled.length - 1; i > 0; i--) {
-                const j = await uniformBelow(reader, i + 1);
-                [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+            const picked = [];
+            while (picked.length < ctx.length) {
+                const shuffled = pool.slice();
+                for (let i = shuffled.length - 1; i > 0; i--) {
+                    const j = await uniformBelow(reader, i + 1);
+                    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+                }
+                const take = Math.min(shuffled.length, ctx.length - picked.length);
+                for (let i = 0; i < take; i++) {
+                    picked.push(shuffled[i]);
+                }
             }
-            const picked = shuffled.slice(0, ctx.length);
+
             const present = new Set(picked.map(item => item.type));
             if (present.size === requiredTypes.size) {
                 return picked.map(item => item.char).join('');
@@ -5125,16 +5131,6 @@
             setCustomRangeState(customSelected);
         }
 
-        // 当前选项允许的字符总数与必选类别数。
-        function getAccountCapacity() {
-            const sets = buildCharacterSets(
-                includeSpecialACheckbox.checked,
-                includeSpecialBCheckbox.checked,
-                excludeSimilarCheckbox.checked
-            );
-            return Object.keys(sets).reduce((sum, key) => sum + sets[key].length, 0);
-        }
-
         function getAccountRequiredTypes() {
             let count = 3;
             if (includeSpecialACheckbox.checked) count++;
@@ -5142,10 +5138,10 @@
             return count;
         }
 
-        // 滑块最大值跟随字符集容量，超出容量的预设直接禁用。
+        // 长度上限固定 256；字符池容量只影响轮数，不再限制滑块。
         function syncAccountLengthCapacity() {
-            const max = getAccountCapacity();
             const min = getAccountRequiredTypes();
+            const max = 256;
             accountCustomSlider.min = min;
             accountCustomSlider.max = max;
             accountCustomDisplay.min = min;
@@ -5153,7 +5149,7 @@
 
             accountLengthRadios.forEach(radio => {
                 if (radio.value !== 'custom') {
-                    radio.disabled = parseInt(radio.value, 10) > max;
+                    radio.disabled = false;
                 }
             });
 
@@ -5645,6 +5641,16 @@
             includeSpecialB: true,
             excludeSimilar: false,
             expected: 'Ig3=^'
+        }),
+        Object.freeze({
+            platform: 'len.example',
+            account: 'max256basic',
+            email: '',
+            length: 256,
+            includeSpecialA: false,
+            includeSpecialB: false,
+            excludeSimilar: true,
+            expected: 'Ay47gFXbtTEGYPwzar8hk9DHZcJ3efdQK6nvmqUuSVBpsCLMWRx2Nj5pbLP5SVFKmxX74T2EcGkZCBvfg6YhWs93HQJwDeartuny8dMUNzqRjAcY3QasZLej6VzBmy7tk9KuWXARfnMbF5xNE2pqPvg8UHJ4CdhrwDSGTtSDGPJuEAmRfyzLBCTZnerq8kxKpUFQdgch46bjHNas397M5VWv2XYwfnSyd9PNbYBURwag6rJKAuVGvHzsMpZj45Wk'
         })
     ]);
 
