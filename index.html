@@ -1691,7 +1691,8 @@
         <h3 class="modal-title">主密码设置</h3>
         <div class="modal-message">
             输入主密码。它只在本机使用，经 PBKDF2-HMAC-SHA-256（310,000 次）派生根密钥后，确定性地生成各平台密码。请牢记该字符串：相同输入才会得到相同密码。<br>
-            首尾空格会被忽略；Unicode 按 NFC 规范化，视觉相同的字符视为同一输入。
+            首尾空格会被忽略；Unicode 按 NFC 规范化，视觉相同的字符视为同一输入。<br>
+            请使用高熵、不可预测的主密码；12 个字符只是最低长度，不能保证抗离线猜测。
         </div>
 
         <div class="master-salt-input-group">
@@ -1819,10 +1820,8 @@
         <div class="account-length-row">
             <label>长度</label>
             <div class="radio-group" id="account-length-radio-group">
-                <label class="radio-option"><input type="radio" name="account-pswd-length" value="6">6</label>
                 <label class="radio-option"><input type="radio" name="account-pswd-length" value="10">10</label>
                 <label class="radio-option"><input type="radio" name="account-pswd-length" value="16" checked>16</label>
-                <label class="radio-option"><input type="radio" name="account-pswd-length" value="20">20</label>
                 <label class="radio-option"><input type="radio" name="account-pswd-length" value="32">32</label>
                 <label class="radio-option"><input type="radio" name="account-pswd-length" value="64">64</label>
                 <label class="radio-option"><input type="radio" name="account-pswd-length" value="custom">Set</label>
@@ -1834,9 +1833,6 @@
             </div>
             <!-- 隐藏数字框：保留 id，以兼容下方读取长度的既有逻辑 -->
             <label for="account-password-length-input"></label><input type="hidden" id="account-password-length-input" value="16">
-            <button type="button" id="clear-account-password-length" class="button-clear" title="重置">
-                <span class="clear-icon"></span>
-            </button>
         </div>
     </div>
 
@@ -3692,6 +3688,8 @@
             this.lastOri = '';
             this.lastPwd = '';
             this.fullResult = '';
+            this.resultContext = null;
+            this.requestSeq = 0;
             this.isCalculating = false;
             this.isKeyLengthDragging = false;
             this.shouldSaveHistory = false;
@@ -3699,9 +3697,18 @@
             this.isSavingHistory = false;
         }
 
+        // 清空当前结果并使在途请求失效；刷新按钮使用。
+        resetResult() {
+            this.requestSeq++;
+            this.resultContext = null;
+            this.fullResult = '';
+            this.lastOri = '';
+            this.lastPwd = '';
+        }
+
         // 用密钥做 PBKDF2，得到编码用的 AES 密钥。
         async generateAESKey(pwd) {
-            const cacheKey = `aes_key_${pwd}`;
+            const cacheKey = JSON.stringify(['aes_key', pwd]);
             if (cryptoUtils.cache.has(cacheKey)) {
                 return cryptoUtils.cache.get(cacheKey);
             }
@@ -3734,7 +3741,7 @@
 
         // 用原文和密钥派生固定 IV，保证可复现。
         async generateIV(ori, pwd) {
-            const cacheKey = `iv_${ori}_${pwd}`;
+            const cacheKey = JSON.stringify(['iv', ori, pwd]);
             if (cryptoUtils.cache.has(cacheKey)) {
                 return cryptoUtils.cache.get(cacheKey);
             }
@@ -3749,7 +3756,7 @@
 
         // AES-GCM 加密并转成十六进制。
         async aesGcmEncrypt(data, key, iv) {
-            const cacheKey = `encrypt_${data}_${cryptoUtils.arrayBufferToHex(iv)}`;
+            const cacheKey = JSON.stringify(['encrypt', data, cryptoUtils.arrayBufferToHex(iv)]);
             if (cryptoUtils.cache.has(cacheKey)) {
                 return cryptoUtils.cache.get(cacheKey);
             }
@@ -3773,7 +3780,7 @@
         async generateFullCode(ori, pwd) {
             if (!ori || !pwd) return '';
 
-            const cacheKey = `fullcode_${ori}_${pwd}`;
+            const cacheKey = JSON.stringify(['fullcode', ori, pwd]);
 
             if (cryptoUtils.pendingCalculations.has(cacheKey)) {
                 return cryptoUtils.pendingCalculations.get(cacheKey);
@@ -3814,6 +3821,7 @@
 
         // 读取输入、校验、计算并显示结果。
         async computeFullCode() {
+            const requestSeq = ++this.requestSeq;
             const ori = document.getElementById('ori-input').value;
             const pwd = document.getElementById('pwd-input').value;
             const keyLength = parseInt(document.getElementById('key-length-input').value) || 0;
@@ -3833,12 +3841,16 @@
             });
 
             if (!oriValid || !pwdValid) {
-                this.fullResult = '';
-                this.updateCodeDisplay();
+                if (requestSeq === this.requestSeq) {
+                    this.fullResult = '';
+                    this.resultContext = null;
+                    this.updateCodeDisplay();
+                }
                 return;
             }
 
-            if (ori === this.lastOri && pwd === this.lastPwd && this.fullResult) {
+            const context = JSON.stringify([ori, pwd]);
+            if (this.resultContext === context && this.fullResult) {
                 this.updateCodeDisplay();
                 return;
             }
@@ -3851,15 +3863,33 @@
             document.getElementById('result-box').classList.remove('filled');
 
             try {
-                this.fullResult = await this.generateFullCode(ori, pwd);
+                const result = await this.generateFullCode(ori, pwd);
+
+                // 只有最新请求、且输入仍是本次输入时才写回结果。
+                if (requestSeq !== this.requestSeq) {
+                    return;
+                }
+                if (document.getElementById('ori-input').value !== ori ||
+                    document.getElementById('pwd-input').value !== pwd) {
+                    return;
+                }
+
+                this.fullResult = result;
+                this.resultContext = context;
                 this.updateCodeDisplay();
             } catch (error) {
+                if (requestSeq !== this.requestSeq) {
+                    return;
+                }
                 console.error('计算失败:', error);
                 this.fullResult = '';
+                this.resultContext = null;
                 document.getElementById('result-box').textContent = '计算失败';
                 document.getElementById('result-box').classList.remove('filled');
             } finally {
-                this.isCalculating = false;
+                if (requestSeq === this.requestSeq) {
+                    this.isCalculating = false;
+                }
             }
         }
 
@@ -3915,6 +3945,10 @@
             const pwd = document.getElementById('pwd-input').value;
             const keyLength = parseInt(document.getElementById('key-length-input').value) || 0;
             const result = document.getElementById('result-box').textContent;
+
+            if (this.resultContext !== JSON.stringify([ori, pwd])) {
+                return;
+            }
 
             if (ori && pwd && result && result !== '等待输入' && result !== '计算中...' && result !== '计算失败') {
                 this.saveHistoryDebounced(keyLength);
@@ -5123,8 +5157,8 @@
 
         refreshCodeBtn.addEventListener('click', function() {
             cryptoUtils.clearCache();
-            codeGenerator.lastOri = '';
-            codeGenerator.lastPwd = '';
+            // 同时清空结果上下文，避免 computeFullCode 直接复用旧结果。
+            codeGenerator.resetResult();
             scheduleCodeUpdate();
         });
 
@@ -5139,7 +5173,6 @@
         const includeSpecialBCheckbox = document.getElementById('account-include-special-b');
         const excludeSimilarCheckbox = document.getElementById('account-exclude-similar');
         const accountPasswordLengthInput = document.getElementById('account-password-length-input');
-        const clearAccountPasswordLengthBtn = document.getElementById('clear-account-password-length');
         const refreshAccountPasswordBtn = document.getElementById('refresh-account-password');
         const copyAccountPasswordBtn = document.getElementById('copy-account-password');
 
@@ -5148,7 +5181,7 @@
         const accountCustomRange = document.getElementById('account-custom-length-range');
         const accountCustomSlider = document.getElementById('account-custom-length-slider');
         const accountCustomDisplay = document.getElementById('account-custom-length-display');
-        const PRESET_LENGTHS = [6, 10, 16, 20, 32, 64];
+        const PRESET_LENGTHS = [10, 16, 32, 64];
 
         function getCurrentLen() {
             const v = parseInt(accountPasswordLengthInput.value, 10);
@@ -5321,12 +5354,6 @@
             scheduleAccountPasswordUpdate();
         });
 
-        clearAccountPasswordLengthBtn.addEventListener('click', function() {
-            accountPasswordLengthInput.value = '16';
-            syncAccountLengthRadios();
-            scheduleAccountPasswordUpdate();
-        });
-
         refreshAccountPasswordBtn.addEventListener('click', function() {
             enhancedAccountPasswordGenerator.clearCache();
             cryptoUtils.clearCache();
@@ -5438,6 +5465,15 @@
 
         // ==================== 复制功能 ====================
         copyResultBtn.addEventListener('click', function() {
+            const ori = document.getElementById('ori-input').value;
+            const pwd = document.getElementById('pwd-input').value;
+
+            // 结果必须对应当前原文和密钥，避免复制旧结果。
+            if (codeGenerator.resultContext !== JSON.stringify([ori, pwd])) {
+                messageManager.show('结果与当前输入不一致，请重新计算', 'warning', 3000);
+                return;
+            }
+
             const result = document.getElementById('result-box').textContent;
             const originalHTML = this.innerHTML;
 
