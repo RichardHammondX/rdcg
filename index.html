@@ -1969,7 +1969,7 @@
     </div>
 </div>
 
-<!-- 功能块3：编码生成器 -->
+<!-- 功能块3：编码生成器（暂时停用）
 <div class="card" id="code-card">
     <h2>
         编码生成器
@@ -2031,7 +2031,7 @@
         </button>
     </div>
 
-    <!-- 编码生成历史记录面板 -->
+    编码生成历史记录面板
     <div class="history-panel" id="code-history">
         <div class="history-panel-header">
             <div class="history-header-row">
@@ -2052,6 +2052,7 @@
         </div>
     </div>
 </div>
+-->
 
 <!-- 功能块4：密码核对 -->
 <div class="card" id="verify-card">
@@ -3559,6 +3560,7 @@
 
     const historyManager = new HistoryManager();
 
+    /* 编码生成器模块暂时停用
     // ==================== 功能块3：编码生成器 ====================
     class CodeGenerator {
         constructor() {
@@ -3819,6 +3821,7 @@
 
     const codeGenerator = new CodeGenerator();
     window.codeGenerator = codeGenerator;
+    */
 
     // ==================== 功能块1：增强的账户密码生成器 ====================
     class EnhancedAccountPasswordGenerator {
@@ -4787,19 +4790,22 @@
 
         const accountHistoryCount = historyManager.getHistory(historyManager.STORAGE_KEYS.ACCOUNT).length;
         const passwordHistoryCount = historyManager.getHistory(historyManager.STORAGE_KEYS.PASSWORD).length;
-        const codeHistoryCount = historyManager.getHistory(historyManager.STORAGE_KEYS.CODE).length;
+        // 编码模块暂时停用：不再读取编码历史计数
+        // const codeHistoryCount = historyManager.getHistory(historyManager.STORAGE_KEYS.CODE).length;
         const verifyHistoryCount = historyManager.getHistory(historyManager.STORAGE_KEYS.VERIFY).length;
 
         document.getElementById('account-history-count').textContent = accountHistoryCount;
         document.getElementById('password-history-count').textContent = passwordHistoryCount;
-        document.getElementById('code-history-count').textContent = codeHistoryCount;
+        // document.getElementById('code-history-count').textContent = codeHistoryCount;
         document.getElementById('verify-history-count').textContent = verifyHistoryCount;
 
-        let codeRAF = null;
+        // 编码模块暂时停用
+        // let codeRAF = null;
         let accountPasswordRAF = null;
         let accountPasswordSeq = 0;
         let passwordRAF = null;
 
+        /* 编码模块暂时停用
         // 重新计算编码结果。
         function scheduleCodeUpdate() {
             if (codeRAF) cancelAnimationFrame(codeRAF);
@@ -4807,6 +4813,7 @@
                 codeGenerator.computeFullCode();
             });
         }
+        */
 
         // 防抖后生成账户密码，只有最新请求能写界面。
         function scheduleAccountPasswordUpdate(immediate = false) {
@@ -4945,6 +4952,7 @@
             });
         }
 
+        /* 编码模块暂时停用
         // ==================== 功能块3事件 ====================
         const oriInput = document.getElementById('ori-input');
         const pwdInput = document.getElementById('pwd-input');
@@ -5060,6 +5068,7 @@
             codeGenerator.resetResult();
             scheduleCodeUpdate();
         });
+        */
 
         // ==================== 功能块1事件 ====================
         const platformInput = document.getElementById('platform-input');
@@ -5410,6 +5419,7 @@
         });
 
         // ==================== 复制功能 ====================
+        /* 编码模块暂时停用
         copyResultBtn.addEventListener('click', function() {
             const ori = document.getElementById('ori-input').value;
             const pwd = document.getElementById('pwd-input').value;
@@ -5445,6 +5455,7 @@
                 });
             }
         });
+        */
 
         copyAccountPasswordBtn.addEventListener('click', function() {
             if (SELF_TEST_STATE !== 'pass') {
